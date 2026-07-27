@@ -19,8 +19,18 @@ static const int   VC_BANK_SPLIT = 16;     // V0..15 -> Wire, V16..31 -> Wire2
 static const float VC_KPA_MIN = -100.0f;
 static const float VC_KPA_MAX =  500.0f;
 
-// --- Accessors implemented in vc2.ino --------------------------------------
+// Standalone slider control range (mV). The touchscreen sliders map their
+// travel onto this band; the DAC still accepts 0..10000 mV.
+static const int VC_SB_MV_MIN = 1600;
+static const int VC_SB_MV_MAX = 3000;
+
+// --- Read accessors (implemented in vc2.ino) -------------------------------
 float vcValueKpa(int valve);   // current setpoint as output pressure (kPa)
+int   vcValueMv(int valve);    // current setpoint in mV (raw, voltage mode)
 int   vcValveOn(int valve);    // 1 if the valve has a non-zero setpoint, else 0
 int   vcActiveCount(void);     // number of valves currently on
-void  vcEmergencyStop(void);   // UI-triggered: all valves off + serial notice
+
+// --- Write / control (implemented in vc2.ino) ------------------------------
+void  vcSetValveMv(int valve, int mV);  // drive a valve (standalone sliders)
+void  vcEmergencyStop(void);            // all valves off + serial notice
+void  vcSetSerialIgnore(bool ignore);   // true = discard incoming serial cmds

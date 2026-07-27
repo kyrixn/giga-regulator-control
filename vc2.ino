@@ -101,6 +101,12 @@ int dacChannels[NUM_VALVES];
 // Track current value for each valve (pressure in kPa or voltage in mV)
 int currentValue[NUM_VALVES] = {0};
 
+// Serial input buffer, and a flag the display UI sets to make the serial
+// handler drain-and-discard incoming commands (standalone mode). Declared here
+// so the UI accessors below can reference them.
+String inputBuffer = "";
+static bool g_ignoreSerial = false;
+
 /**
  * Build the valve -> (DAC, channel) mapping.
  *   valves 0..15  -> dacBus0[0..7], channels 0/1
@@ -252,6 +258,10 @@ float vcValueKpa(int valve) {
   #endif
 }
 
+int vcValueMv(int valve) {
+  return getValveValue(valve);            // currentValue is mV in voltage mode
+}
+
 int vcValveOn(int valve) {
   return getValveValue(valve) != 0 ? 1 : 0;
 }
@@ -260,16 +270,25 @@ int vcActiveCount(void) {
   return countActiveValves();
 }
 
+void vcSetValveMv(int valve, int mV) {
+  setValve(valve, mV);                    // setValve clamps to the DAC range
+}
+
 void vcEmergencyStop(void) {
   allValvesOff();
   Serial.println("EMERGENCY STOP - All valves OFF");  // keep the PC app in sync
 }
 
+void vcSetSerialIgnore(bool ignore) {
+  g_ignoreSerial = ignore;
+  inputBuffer = "";
+  Serial.println(ignore ? "STANDALONE MODE - serial ignored"
+                        : "MONITOR MODE - serial active");
+}
+
 // ============================================================
 // Serial Command Processing
 // ============================================================
-
-String inputBuffer = "";
 
 /**
  * Process serial commands
@@ -282,6 +301,12 @@ String inputBuffer = "";
 void processSerialCommand() {
   while (Serial.available()) {
     char c = Serial.read();
+
+    // Standalone mode: keep the RX buffer drained but ignore the content.
+    if (g_ignoreSerial) {
+      inputBuffer = "";
+      continue;
+    }
 
     if (c == '\n' || c == '\r') {
       if (inputBuffer.length() > 0) {
