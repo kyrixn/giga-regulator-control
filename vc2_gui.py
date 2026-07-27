@@ -2,11 +2,11 @@
 """
 vc2_gui.py
 
-Interactive GUI for the vc2 16-valve controller. Reuses the serial layer
+Interactive GUI for the vc2 32-valve controller. Reuses the serial layer
 from vc2_control.py (ValveController) and replaces the terminal input
 loop with on-figure matplotlib widgets:
 
-  - One TextBox under each bar (V0..V15):
+  - One TextBox under each bar (V0..V31):
         * Type a number + Enter to set that valve immediately
         * Type "off" (or o/x) + Enter to turn that valve off
         * Clicking away does NOT submit — the typed text stays in the box
@@ -15,6 +15,8 @@ loop with on-figure matplotlib widgets:
   - STOP button: emergency stop (sends 's' to Arduino)
   - ? STATUS button: query all valve states
   - PING button: ping the Arduino
+
+Layout: 4 rows of 8 valves. V0-V15 are on Wire, V16-V31 on Wire1.
 
 Values above 4000 are rejected (MAX_INPUT_VALUE in vc2_control.py).
 Arduino may allow higher; Python never sends more than 4000.
@@ -31,7 +33,9 @@ import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
 from matplotlib.widgets import TextBox, Button
 
-from vc2_control import ValveController, NUM_VALVES
+from vc2_control import (
+    ValveController, NUM_VALVES, NUM_ROWS, ROW_SIZE, row_title,
+)
 
 
 # ============================================================
@@ -40,12 +44,14 @@ from vc2_control import ValveController, NUM_VALVES
 PLOT_LEFT   = 0.06
 PLOT_RIGHT  = 0.85
 PLOT_WIDTH  = PLOT_RIGHT - PLOT_LEFT
-SLOT_W      = PLOT_WIDTH / 8        # one slot per valve in a row of 8
+SLOT_W      = PLOT_WIDTH / ROW_SIZE     # one slot per valve in a row
 
-TB_W        = 0.075                 # textbox width
-TB_H        = 0.035                 # textbox height
-TOP_TB_Y    = 0.615                 # y of top textbox row
-BOT_TB_Y    = 0.195                 # y of bottom textbox row
+TB_W        = 0.075                     # textbox width
+
+# Vertical band per row. Bands stack top-to-bottom between these margins.
+TOP_MARGIN    = 0.94
+BOTTOM_MARGIN = 0.055
+BAND_H        = (TOP_MARGIN - BOTTOM_MARGIN) / NUM_ROWS
 
 BTN_X       = 0.87
 BTN_W       = 0.11
@@ -66,16 +72,22 @@ COLORS = {
 }
 
 
+def _row_bounds(r):
+    """Return (v_lo, v_hi) valve indices for display row r (0 = top)."""
+    v_lo = r * ROW_SIZE
+    v_hi = min(v_lo + ROW_SIZE - 1, NUM_VALVES - 1)
+    return v_lo, v_hi
+
+
 class InteractiveDisplay:
-    """Matplotlib figure with bar plot + per-valve input boxes + STOP button."""
+    """Matplotlib figure with bar plots + per-valve input boxes + STOP button."""
 
     def __init__(self, controller):
         self.controller = controller
         self.fig = None
         self.ani = None
-        self.ax_top = None
-        self.ax_bot = None
-        self.textboxes = []        # list of TextBox, indexed by valve id (0..15)
+        self.axes = []             # one bar-plot axis per row, top to bottom
+        self.textboxes = []        # list of TextBox, indexed by valve id (0..31)
         self.status_text = None
         self.msg_text = None
         self.recent_msgs = []
@@ -97,9 +109,10 @@ class InteractiveDisplay:
 
     def setup(self):
         plt.style.use('dark_background')
-        self.fig = plt.figure(figsize=(15, 8.5), facecolor=COLORS['bg'])
+        self.fig = plt.figure(figsize=(15, 2.4 + 2.1 * NUM_ROWS),
+                              facecolor=COLORS['bg'])
         try:
-            self.fig.canvas.manager.set_window_title('16-Valve Controller (Interactive)')
+            self.fig.canvas.manager.set_window_title('32-Valve Controller (Interactive)')
         except Exception:
             pass
 
@@ -111,31 +124,38 @@ class InteractiveDisplay:
         self.fig.canvas.mpl_connect('key_press_event', self._on_key_press)
 
         self.fig.suptitle(
-            '16-Valve Controller  (Interactive)',
+            '32-Valve Controller  (Interactive)',
             fontsize=17, color=COLORS['text'], fontweight='bold',
-            fontfamily='monospace', y=0.97
+            fontfamily='monospace', y=0.985
         )
 
-        # Top bar plot + textboxes for V0..V7
-        self.ax_top = self.fig.add_axes([PLOT_LEFT, 0.66, PLOT_WIDTH, 0.26])
-        self._style_axes(self.ax_top, 0, 7, 'Valves 0-7  (Wire)')
-        self._make_textbox_row(0, 7, TOP_TB_Y)
+        # One bar plot + one textbox row per band, stacked top to bottom.
+        self.axes = []
+        for r in range(NUM_ROWS):
+            v_lo, v_hi = _row_bounds(r)
+            band_top = TOP_MARGIN - r * BAND_H
+            band_bottom = band_top - BAND_H
 
-        # Bottom bar plot + textboxes for V8..V15
-        self.ax_bot = self.fig.add_axes([PLOT_LEFT, 0.24, PLOT_WIDTH, 0.26])
-        self._style_axes(self.ax_bot, 8, 15, 'Valves 8-15 (Wire1)')
-        self._make_textbox_row(8, 15, BOT_TB_Y)
+            plot_h = BAND_H * 0.50
+            plot_y = band_bottom + BAND_H * 0.34
+            ax = self.fig.add_axes([PLOT_LEFT, plot_y, PLOT_WIDTH, plot_h])
+            self._style_axes(ax, v_lo, v_hi, row_title(v_lo, v_hi))
+            self.axes.append(ax)
+
+            tb_h = min(0.032, BAND_H * 0.16)
+            tb_y = band_bottom + BAND_H * 0.06
+            self._make_textbox_row(v_lo, v_hi, tb_y, tb_h)
 
         self._make_buttons()
 
         self.status_text = self.fig.text(
-            0.98, 0.97, '\u25cf IDLE', fontsize=11,
+            0.98, 0.985, '● IDLE', fontsize=11,
             color=COLORS['text_dim'], fontfamily='monospace',
             ha='right', va='top'
         )
 
         self.fig.text(
-            PLOT_LEFT, 0.025,
+            PLOT_LEFT, 0.012,
             "Enter fires that valve (single).   "
             "Click-away keeps text but doesn't fire.   "
             "APPLY ALL fires every non-empty box in one batch.   "
@@ -144,16 +164,16 @@ class InteractiveDisplay:
         )
 
         self.msg_text = self.fig.text(
-            PLOT_LEFT, 0.07, '',
-            fontsize=9, color=COLORS['text_dim'], fontfamily='monospace',
-            va='bottom'
+            BTN_X, 0.16, '',
+            fontsize=8, color=COLORS['text_dim'], fontfamily='monospace',
+            va='top'
         )
 
-    def _make_textbox_row(self, v_lo, v_hi, y):
-        """Place 8 TextBox widgets, one per valve in the row, aligned to bars."""
+    def _make_textbox_row(self, v_lo, v_hi, y, tb_h):
+        """Place TextBox widgets, one per valve in the row, aligned to bars."""
         for i in range(v_lo, v_hi + 1):
             cx = PLOT_LEFT + ((i - v_lo) + 0.5) * SLOT_W
-            ax_tb = self.fig.add_axes([cx - TB_W / 2, y, TB_W, TB_H])
+            ax_tb = self.fig.add_axes([cx - TB_W / 2, y, TB_W, tb_h])
             tb = TextBox(
                 ax_tb, '', initial='',
                 color=COLORS['panel'], hovercolor=COLORS['accent']
@@ -170,7 +190,7 @@ class InteractiveDisplay:
 
     def _make_buttons(self):
         # STOP (big red, top of column)
-        ax_stop = self.fig.add_axes([BTN_X, 0.62, BTN_W, 0.28])
+        ax_stop = self.fig.add_axes([BTN_X, 0.62, BTN_W, 0.30])
         self.btn_stop = Button(
             ax_stop, 'STOP',
             color=COLORS['stop'], hovercolor=COLORS['stop_h']
@@ -181,7 +201,7 @@ class InteractiveDisplay:
         self.btn_stop.on_clicked(self._on_stop)
 
         # APPLY ALL (medium green, mid column)
-        ax_apply = self.fig.add_axes([BTN_X, 0.40, BTN_W, 0.18])
+        ax_apply = self.fig.add_axes([BTN_X, 0.42, BTN_W, 0.16])
         self.btn_apply = Button(
             ax_apply, 'APPLY ALL',
             color=COLORS['apply'], hovercolor=COLORS['apply_h']
@@ -192,7 +212,7 @@ class InteractiveDisplay:
         self.btn_apply.on_clicked(self._on_apply_all)
 
         # ? STATUS
-        ax_qry = self.fig.add_axes([BTN_X, 0.30, BTN_W, 0.06])
+        ax_qry = self.fig.add_axes([BTN_X, 0.33, BTN_W, 0.05])
         self.btn_qry = Button(
             ax_qry, '? STATUS',
             color=COLORS['accent'], hovercolor=COLORS['accent_h']
@@ -202,7 +222,7 @@ class InteractiveDisplay:
         self.btn_qry.on_clicked(lambda _: self.controller.query_status())
 
         # PING
-        ax_ping = self.fig.add_axes([BTN_X, 0.22, BTN_W, 0.06])
+        ax_ping = self.fig.add_axes([BTN_X, 0.26, BTN_W, 0.05])
         self.btn_ping = Button(
             ax_ping, 'PING',
             color=COLORS['accent'], hovercolor=COLORS['accent_h']
@@ -340,12 +360,11 @@ class InteractiveDisplay:
 
     def _style_axes(self, ax, v_lo, v_hi, title):
         ax.set_facecolor(COLORS['panel'])
-        ax.set_title(title, color=COLORS['text'], fontsize=12,
+        ax.set_title(title, color=COLORS['text'], fontsize=11,
                      fontfamily='monospace', loc='left')
         ax.set_xlim(v_lo - 0.5, v_hi + 0.5)
         ax.set_ylim(0, 10500)
         ax.set_xticks(range(v_lo, v_hi + 1))
-        ax.set_xlabel('Valve', color=COLORS['text_dim'], fontfamily='monospace')
         ax.set_ylabel('mV', color=COLORS['text_dim'], fontfamily='monospace')
         ax.tick_params(colors=COLORS['text_dim'])
         ax.spines['bottom'].set_color(COLORS['accent'])
@@ -374,13 +393,13 @@ class InteractiveDisplay:
                 mV = snapshot[v]
                 ax.bar(v, mV, 0.6, color=COLORS['valve_bar'], alpha=0.85)
                 bar = self._mv_to_bar(mV)
-                ax.text(v, mV + 200, f'{bar:.2f} bar', ha='center', fontsize=9,
+                ax.text(v, mV + 200, f'{bar:.2f} bar', ha='center', fontsize=8,
                         color=COLORS['text'])
                 any_active = True
 
         if not any_active:
             ax.text((v_lo + v_hi) / 2.0, 5000, 'No active valves',
-                    ha='center', va='center', fontsize=13,
+                    ha='center', va='center', fontsize=12,
                     color=COLORS['text_dim'], fontfamily='monospace')
 
     def update(self, _frame):
@@ -388,21 +407,22 @@ class InteractiveDisplay:
         with ctrl.display_lock:
             snapshot = dict(ctrl.valve_data)
 
-        self._redraw_row(self.ax_top, 0, 7, 'Valves 0-7  (Wire)', snapshot)
-        self._redraw_row(self.ax_bot, 8, 15, 'Valves 8-15 (Wire1)', snapshot)
+        for r, ax in enumerate(self.axes):
+            v_lo, v_hi = _row_bounds(r)
+            self._redraw_row(ax, v_lo, v_hi, row_title(v_lo, v_hi), snapshot)
 
         if snapshot:
-            self.status_text.set_text(f'\u25cf ACTIVE ({len(snapshot)})')
+            self.status_text.set_text(f'● ACTIVE ({len(snapshot)})')
             self.status_text.set_color(COLORS['active'])
         else:
-            self.status_text.set_text('\u25cf IDLE')
+            self.status_text.set_text('● IDLE')
             self.status_text.set_color(COLORS['text_dim'])
 
         # Drain message queue and show the last few lines on the figure.
         while ctrl.message_queue:
             self.recent_msgs.append(ctrl.message_queue.popleft())
-        if len(self.recent_msgs) > 4:
-            self.recent_msgs = self.recent_msgs[-4:]
+        if len(self.recent_msgs) > 6:
+            self.recent_msgs = self.recent_msgs[-6:]
         self.msg_text.set_text('\n'.join(self.recent_msgs))
 
         return []
@@ -433,7 +453,7 @@ def main():
     port = sys.argv[1] if len(sys.argv) > 1 else None
 
     print("=" * 65)
-    print("   16-VALVE CONTROLLER (Interactive GUI)")
+    print("   32-VALVE CONTROLLER (Interactive GUI)")
     print("=" * 65)
 
     controller = ValveController(port)

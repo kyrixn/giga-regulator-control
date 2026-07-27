@@ -1,24 +1,30 @@
 /**
  * vc2.ino
  *
- * 16-Valve Controller (Feedforward) for Arduino Giga R1 - dual I2C bus.
+ * 32-Valve Controller (Feedforward) for Arduino Giga R1 - dual I2C bus.
  *
  * Hardware:
- *   Wire  (SDA/SCL):    4 GP8403 DACs at 0x58..0x5B  -> valves 0..7
- *   Wire1 (SDA1/SCL1):  4 GP8403 DACs at 0x58..0x5B  -> valves 8..15
- *   DAC output: 0-10V
+ *   Wire  (SDA/SCL):    8 GP8403 DACs at 0x58..0x5F  -> valves 0..15
+ *   Wire1 (SDA1/SCL1):  8 GP8403 DACs at 0x58..0x5F  -> valves 16..31
+ *   DAC output: 0-10V   (2 channels per DAC -> 2 valves per DAC)
+ *
+ * 16 DACs total (8 per bus), 32 regulators total.
  *
  * Valve-to-DAC mapping (2 channels per DAC):
- *   V0,V1   = Wire  0x58 ch0,ch1     V8 ,V9   = Wire1 0x58 ch0,ch1
- *   V2,V3   = Wire  0x59 ch0,ch1     V10,V11  = Wire1 0x59 ch0,ch1
- *   V4,V5   = Wire  0x5A ch0,ch1     V12,V13  = Wire1 0x5A ch0,ch1
- *   V6,V7   = Wire  0x5B ch0,ch1     V14,V15  = Wire1 0x5B ch0,ch1
+ *   Bus Wire   DAC 0x58 -> V0 ,V1     Bus Wire1  DAC 0x58 -> V16,V17
+ *              DAC 0x59 -> V2 ,V3                DAC 0x59 -> V18,V19
+ *              DAC 0x5A -> V4 ,V5                DAC 0x5A -> V20,V21
+ *              DAC 0x5B -> V6 ,V7                DAC 0x5B -> V22,V23
+ *              DAC 0x5C -> V8 ,V9                DAC 0x5C -> V24,V25
+ *              DAC 0x5D -> V10,V11               DAC 0x5D -> V26,V27
+ *              DAC 0x5E -> V12,V13               DAC 0x5E -> V28,V29
+ *              DAC 0x5F -> V14,V15               DAC 0x5F -> V30,V31
  *
  * Commands (Serial @ 115200):
- *   valve,value        Set single valve: 0,3000 or 9,2100
- *   v1,val1,v2,val2,.. Set multiple valves: 0,3000,9,2500
- *   valve,off          Turn off a valve: 9,off
- *   s                  Emergency stop (all 16 valves off)
+ *   valve,value        Set single valve: 0,3000 or 20,2100
+ *   v1,val1,v2,val2,.. Set multiple valves: 0,3000,20,2500
+ *   valve,off          Turn off a valve: 20,off
+ *   s                  Emergency stop (all 32 valves off)
  *   ?                  Query status of all valves
  *   p                  Ping test
  */
@@ -27,7 +33,12 @@
 #include <Wire.h>
 #include "DFRobot_GP8403.h"
 
-#define NUM_VALVES 16
+#define DACS_PER_BUS 8
+#define NUM_DACS     (DACS_PER_BUS * 2)   // 16 DACs across both buses
+#define NUM_VALVES   (NUM_DACS * 2)       // 32 valves (2 channels per DAC)
+
+// First contiguous I2C address of the DACs on each bus (0x58..0x5F).
+#define DAC_ADDR_BASE 0x58
 
 // ============================================================
 // INPUT MODE: Change this flag to switch input format
@@ -51,38 +62,49 @@
 // ============================================================
 // DAC instances
 // ============================================================
+// One object per physical DAC. Bus 0 (Wire) drives valves 0..15,
+// bus 1 (Wire1) drives valves 16..31. Addresses run 0x58..0x5F on
+// each bus.
 
-// Wire (valves 0..7)
-DFRobot_GP8403 dac0_58(&Wire, 0x58);
-DFRobot_GP8403 dac0_59(&Wire, 0x59);
-DFRobot_GP8403 dac0_5A(&Wire, 0x5A);
-DFRobot_GP8403 dac0_5B(&Wire, 0x5B);
-
-// Wire1 (valves 8..15)
-DFRobot_GP8403 dac1_58(&Wire1, 0x58);
-DFRobot_GP8403 dac1_59(&Wire1, 0x59);
-DFRobot_GP8403 dac1_5A(&Wire1, 0x5A);
-DFRobot_GP8403 dac1_5B(&Wire1, 0x5B);
-
-// Mapping arrays: valve index -> DAC pointer and channel
-DFRobot_GP8403* dacs[NUM_VALVES] = {
-  &dac0_58, &dac0_58,  // Valves 0, 1
-  &dac0_59, &dac0_59,  // Valves 2, 3
-  &dac0_5A, &dac0_5A,  // Valves 4, 5
-  &dac0_5B, &dac0_5B,  // Valves 6, 7
-  &dac1_58, &dac1_58,  // Valves 8, 9
-  &dac1_59, &dac1_59,  // Valves 10, 11
-  &dac1_5A, &dac1_5A,  // Valves 12, 13
-  &dac1_5B, &dac1_5B   // Valves 14, 15
+DFRobot_GP8403 dacBus0[DACS_PER_BUS] = {
+  DFRobot_GP8403(&Wire, DAC_ADDR_BASE + 0), DFRobot_GP8403(&Wire, DAC_ADDR_BASE + 1),
+  DFRobot_GP8403(&Wire, DAC_ADDR_BASE + 2), DFRobot_GP8403(&Wire, DAC_ADDR_BASE + 3),
+  DFRobot_GP8403(&Wire, DAC_ADDR_BASE + 4), DFRobot_GP8403(&Wire, DAC_ADDR_BASE + 5),
+  DFRobot_GP8403(&Wire, DAC_ADDR_BASE + 6), DFRobot_GP8403(&Wire, DAC_ADDR_BASE + 7)
 };
 
-int dacChannels[NUM_VALVES] = {
-  0, 1, 0, 1, 0, 1, 0, 1,
-  0, 1, 0, 1, 0, 1, 0, 1
+DFRobot_GP8403 dacBus1[DACS_PER_BUS] = {
+  DFRobot_GP8403(&Wire1, DAC_ADDR_BASE + 0), DFRobot_GP8403(&Wire1, DAC_ADDR_BASE + 1),
+  DFRobot_GP8403(&Wire1, DAC_ADDR_BASE + 2), DFRobot_GP8403(&Wire1, DAC_ADDR_BASE + 3),
+  DFRobot_GP8403(&Wire1, DAC_ADDR_BASE + 4), DFRobot_GP8403(&Wire1, DAC_ADDR_BASE + 5),
+  DFRobot_GP8403(&Wire1, DAC_ADDR_BASE + 6), DFRobot_GP8403(&Wire1, DAC_ADDR_BASE + 7)
 };
+
+// Mapping arrays: valve index -> DAC pointer and channel.
+// Filled once in buildMapping(). Even valve indices are channel 0 of a
+// DAC, odd indices channel 1, so unique DACs sit at even indices.
+DFRobot_GP8403* dacs[NUM_VALVES];
+int dacChannels[NUM_VALVES];
 
 // Track current value for each valve (pressure in kPa or voltage in mV)
 int currentValue[NUM_VALVES] = {0};
+
+/**
+ * Build the valve -> (DAC, channel) mapping.
+ *   valves 0..15  -> dacBus0[0..7], channels 0/1
+ *   valves 16..31 -> dacBus1[0..7], channels 0/1
+ */
+void buildMapping() {
+  for (int d = 0; d < DACS_PER_BUS; d++) {
+    int v0 = d * 2;                 // bus 0 valves 0..15
+    dacs[v0]     = &dacBus0[d]; dacChannels[v0]     = 0;
+    dacs[v0 + 1] = &dacBus0[d]; dacChannels[v0 + 1] = 1;
+
+    int v1 = 16 + d * 2;            // bus 1 valves 16..31
+    dacs[v1]     = &dacBus1[d]; dacChannels[v1]     = 0;
+    dacs[v1 + 1] = &dacBus1[d]; dacChannels[v1 + 1] = 1;
+  }
+}
 
 // ============================================================
 // Valve Functions
@@ -96,7 +118,7 @@ int currentValue[NUM_VALVES] = {0};
 bool initValves() {
   bool success = true;
 
-  // Initialize each unique DAC (indices 0, 2, 4, ..., 14)
+  // Initialize each unique DAC (indices 0, 2, 4, ..., NUM_VALVES-2)
   for (int i = 0; i < NUM_VALVES; i += 2) {
     if (dacs[i]->begin() != 0) {
       Serial.print("ERROR: DAC init failed for valves ");
@@ -124,7 +146,7 @@ bool initValves() {
 /**
  * Set valve output
  *
- * @param valve Valve index (0-15)
+ * @param valve Valve index (0-31)
  * @param value Pressure in kPa (if INPUT_PRESSURE_MODE) or voltage in mV (if not)
  * @return true if successful, false if invalid valve index
  */
@@ -209,7 +231,7 @@ String inputBuffer = "";
 
 /**
  * Process serial commands
- * Format: valve,pressure  e.g. 0,3000 or 9,2100
+ * Format: valve,pressure  e.g. 0,3000 or 20,2100
  * Special commands:
  *   s or S - Emergency stop (all valves off)
  *   ?      - Print status of all valves
@@ -332,11 +354,13 @@ void setup() {
   delay(1000);
 
   Serial.println(F("\n========================================"));
-  Serial.println(F("  16-Valve Controller (Dual-Bus)"));
+  Serial.println(F("  32-Valve Controller (Dual-Bus)"));
   Serial.println(F("========================================"));
 
   Wire.begin();
   Wire1.begin();
+
+  buildMapping();
 
   if (initValves()) {
     Serial.println("All DACs initialized successfully!");
@@ -352,7 +376,7 @@ void setup() {
     Serial.println("Mode: VOLTAGE (mV)");
     Serial.println("Range: 0 to 10000 mV");
   #endif
-  Serial.println("Layout: V0-V7 on Wire, V8-V15 on Wire1");
+  Serial.println("Layout: V0-V15 on Wire, V16-V31 on Wire1");
   Serial.println("Commands: valve,value | s=stop | ?=status | p=ping");
 }
 

@@ -2,11 +2,12 @@
 """
 vc2_control.py
 
-16-Valve Controller - Serial Communication Script with Matplotlib Display
+32-Valve Controller - Serial Communication Script with Matplotlib Display
 
-Controls Arduino vc2 sketch for direct voltage/pressure control over 16 DACs:
-  - Valves  0..7  on Wire   (SDA/SCL)
-  - Valves  8..15 on Wire1  (SDA1/SCL1)
+Controls Arduino vc2 sketch for direct voltage/pressure control over 16 DACs
+(8 per I2C bus, 2 channels each = 32 valves):
+  - Valves  0..15  on Wire   (SDA/SCL)
+  - Valves 16..31  on Wire1  (SDA1/SCL1)
 
 Arduino mode (set in Arduino code):
   PRESSURE mode: input in kPa (-100 to 500)
@@ -42,13 +43,25 @@ import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
 
 
-NUM_VALVES = 16
+NUM_VALVES = 32
 ROW_SIZE = 8
+NUM_ROWS = (NUM_VALVES + ROW_SIZE - 1) // ROW_SIZE
+BUS_SPLIT = 16          # valves 0..15 -> Wire, 16..31 -> Wire1
 MAX_INPUT_VALUE = 4000  # mV or kPa — never send values above this
 
 
+def bus_name(valve):
+    """Return the I2C bus label for a valve index."""
+    return 'Wire' if valve < BUS_SPLIT else 'Wire1'
+
+
+def row_title(v_lo, v_hi):
+    """Human-readable title for a row spanning valves v_lo..v_hi."""
+    return f'Valves {v_lo}-{v_hi}  ({bus_name(v_lo)})'
+
+
 class ValveController:
-    """16-Valve serial interface with matplotlib display"""
+    """32-Valve serial interface with matplotlib display"""
 
     def __init__(self, port=None, baudrate=115200):
         self.ser = None
@@ -267,14 +280,13 @@ class ValveController:
 
 
 class LiveDisplay:
-    """Matplotlib display: 16 valves in 2 rows (V0-V7 top, V8-V15 bottom)"""
+    """Matplotlib display: 32 valves in 4 rows of 8 (V0-V15 Wire, V16-V31 Wire1)"""
 
     def __init__(self, controller):
         self.controller = controller
         self.fig = None
         self.ani = None
-        self.ax_top = None
-        self.ax_bot = None
+        self.axes = []          # one axis per row, top to bottom
         self.status_text = None
 
         self.colors = {
@@ -291,21 +303,24 @@ class LiveDisplay:
         """Create the matplotlib figure and axes"""
         plt.style.use('dark_background')
 
-        self.fig = plt.figure(figsize=(13, 7), facecolor=self.colors['bg'])
-        self.fig.canvas.manager.set_window_title('16-Valve Controller')
+        self.fig = plt.figure(figsize=(13, 2 + 2.2 * NUM_ROWS),
+                              facecolor=self.colors['bg'])
+        self.fig.canvas.manager.set_window_title('32-Valve Controller')
 
-        gs = self.fig.add_gridspec(2, 1, hspace=0.35,
-                                   left=0.07, right=0.97, top=0.90, bottom=0.08)
+        gs = self.fig.add_gridspec(NUM_ROWS, 1, hspace=0.55,
+                                   left=0.07, right=0.97, top=0.92, bottom=0.06)
 
-        self.fig.suptitle('16-Valve Controller (Dual-Bus)', fontsize=18,
+        self.fig.suptitle('32-Valve Controller (Dual-Bus)', fontsize=18,
                           color=self.colors['text'], fontweight='bold',
                           fontfamily='monospace')
 
-        self.ax_top = self.fig.add_subplot(gs[0, 0])
-        self._style_axes(self.ax_top, 0, 7, 'Valves 0-7  (Wire)')
-
-        self.ax_bot = self.fig.add_subplot(gs[1, 0])
-        self._style_axes(self.ax_bot, 8, 15, 'Valves 8-15 (Wire1)')
+        self.axes = []
+        for r in range(NUM_ROWS):
+            v_lo = r * ROW_SIZE
+            v_hi = min(v_lo + ROW_SIZE - 1, NUM_VALVES - 1)
+            ax = self.fig.add_subplot(gs[r, 0])
+            self._style_axes(ax, v_lo, v_hi, row_title(v_lo, v_hi))
+            self.axes.append(ax)
 
         self.status_text = self.fig.text(
             0.98, 0.97, '● IDLE', fontsize=10,
@@ -364,8 +379,10 @@ class LiveDisplay:
         with ctrl.display_lock:
             snapshot = dict(ctrl.valve_data)
 
-        self._redraw_row(self.ax_top, 0, 7, 'Valves 0-7  (Wire)', snapshot)
-        self._redraw_row(self.ax_bot, 8, 15, 'Valves 8-15 (Wire1)', snapshot)
+        for r, ax in enumerate(self.axes):
+            v_lo = r * ROW_SIZE
+            v_hi = min(v_lo + ROW_SIZE - 1, NUM_VALVES - 1)
+            self._redraw_row(ax, v_lo, v_hi, row_title(v_lo, v_hi), snapshot)
 
         if snapshot:
             self.status_text.set_text(f'● ACTIVE ({len(snapshot)})')
@@ -393,12 +410,12 @@ class LiveDisplay:
 def print_help():
     print("""
 +-------------------------------------------------------------------+
-|              16-VALVE CONTROLLER - COMMANDS                       |
+|              32-VALVE CONTROLLER - COMMANDS                       |
 +-------------------------------------------------------------------+
-|  VALVE CONTROL  (indices 0..15;  0-7 = Wire,  8-15 = Wire1):      |
-|    valve,value         Set single valve (e.g. 0,3000 or 9,2100)   |
-|    v1,val1,v2,val2,..  Set multiple    (e.g. 0,3000,8,2500)       |
-|    valve,off           Turn off valve  (e.g. 9,off)               |
+|  VALVE CONTROL  (indices 0..31; 0-15 = Wire, 16-31 = Wire1):      |
+|    valve,value         Set single valve (e.g. 0,3000 or 20,2100)  |
+|    v1,val1,v2,val2,..  Set multiple    (e.g. 0,3000,20,2500)      |
+|    valve,off           Turn off valve  (e.g. 20,off)              |
 |    s                   EMERGENCY STOP (all valves off)            |
 |    ?                   Query status of all valves                 |
 +-------------------------------------------------------------------+
@@ -517,7 +534,7 @@ def main():
     port = sys.argv[1] if len(sys.argv) > 1 else None
 
     print("=" * 65)
-    print("      16-VALVE CONTROLLER (Dual-Bus, Feedforward)")
+    print("      32-VALVE CONTROLLER (Dual-Bus, Feedforward)")
     print("=" * 65)
 
     controller = ValveController(port)
