@@ -4,14 +4,19 @@
  * 32-Valve Controller (Feedforward) for Arduino Giga R1 - dual I2C bus.
  *
  * Hardware:
- *   Wire  (SDA/SCL):    8 GP8403 DACs at 0x58..0x5F  -> valves 0..15
- *   Wire1 (SDA1/SCL1):  8 GP8403 DACs at 0x58..0x5F  -> valves 16..31
+ *   Wire  (SDA/SCL,   D20/D21): 8 GP8403 DACs at 0x58..0x5F -> valves 0..15
+ *   Wire2 (SDA2/SCL2, D8/D9):   8 GP8403 DACs at 0x58..0x5F -> valves 16..31
  *   DAC output: 0-10V   (2 channels per DAC -> 2 valves per DAC)
+ *
+ *   NOTE: bank B is on Wire2 (not Wire1) so Wire1 is left free for the GIGA
+ *   Display Shield's GT911 touch controller (0x5D on Wire1, which would clash
+ *   with a DAC). Wire2 has NO internal pull-ups -- the DAC boards' on-board
+ *   pull-ups usually suffice; add ~4.7k to 3V3 on D8/D9 if the bus is flaky.
  *
  * 16 DACs total (8 per bus), 32 regulators total.
  *
  * Valve-to-DAC mapping (2 channels per DAC):
- *   Bus Wire   DAC 0x58 -> V0 ,V1     Bus Wire1  DAC 0x58 -> V16,V17
+ *   Bus Wire   DAC 0x58 -> V0 ,V1     Bus Wire2  DAC 0x58 -> V16,V17
  *              DAC 0x59 -> V2 ,V3                DAC 0x59 -> V18,V19
  *              DAC 0x5A -> V4 ,V5                DAC 0x5A -> V20,V21
  *              DAC 0x5B -> V6 ,V7                DAC 0x5B -> V22,V23
@@ -33,9 +38,15 @@
 #include <Wire.h>
 #include "DFRobot_GP8403.h"
 
+#include "valve_core.h"   // read-only accessors exposed to the display UI
+#include "ui_display.h"   // on-Giga touchscreen UI (non-blocking)
+
 #define DACS_PER_BUS 8
 #define NUM_DACS     (DACS_PER_BUS * 2)   // 16 DACs across both buses
 #define NUM_VALVES   (NUM_DACS * 2)       // 32 valves (2 channels per DAC)
+
+static_assert(NUM_VALVES == VC_NUM_VALVES,
+              "valve_core.h VC_NUM_VALVES must match NUM_VALVES");
 
 // First contiguous I2C address of the DACs on each bus (0x58..0x5F).
 #define DAC_ADDR_BASE 0x58
@@ -63,8 +74,9 @@
 // DAC instances
 // ============================================================
 // One object per physical DAC. Bus 0 (Wire) drives valves 0..15,
-// bus 1 (Wire1) drives valves 16..31. Addresses run 0x58..0x5F on
-// each bus.
+// bus 1 (Wire2) drives valves 16..31. Addresses run 0x58..0x5F on
+// each bus. Wire1 is intentionally NOT used here -- it belongs to the
+// display shield's touch controller.
 
 DFRobot_GP8403 dacBus0[DACS_PER_BUS] = {
   DFRobot_GP8403(&Wire, DAC_ADDR_BASE + 0), DFRobot_GP8403(&Wire, DAC_ADDR_BASE + 1),
@@ -74,10 +86,10 @@ DFRobot_GP8403 dacBus0[DACS_PER_BUS] = {
 };
 
 DFRobot_GP8403 dacBus1[DACS_PER_BUS] = {
-  DFRobot_GP8403(&Wire1, DAC_ADDR_BASE + 0), DFRobot_GP8403(&Wire1, DAC_ADDR_BASE + 1),
-  DFRobot_GP8403(&Wire1, DAC_ADDR_BASE + 2), DFRobot_GP8403(&Wire1, DAC_ADDR_BASE + 3),
-  DFRobot_GP8403(&Wire1, DAC_ADDR_BASE + 4), DFRobot_GP8403(&Wire1, DAC_ADDR_BASE + 5),
-  DFRobot_GP8403(&Wire1, DAC_ADDR_BASE + 6), DFRobot_GP8403(&Wire1, DAC_ADDR_BASE + 7)
+  DFRobot_GP8403(&Wire2, DAC_ADDR_BASE + 0), DFRobot_GP8403(&Wire2, DAC_ADDR_BASE + 1),
+  DFRobot_GP8403(&Wire2, DAC_ADDR_BASE + 2), DFRobot_GP8403(&Wire2, DAC_ADDR_BASE + 3),
+  DFRobot_GP8403(&Wire2, DAC_ADDR_BASE + 4), DFRobot_GP8403(&Wire2, DAC_ADDR_BASE + 5),
+  DFRobot_GP8403(&Wire2, DAC_ADDR_BASE + 6), DFRobot_GP8403(&Wire2, DAC_ADDR_BASE + 7)
 };
 
 // Mapping arrays: valve index -> DAC pointer and channel.
@@ -224,6 +236,36 @@ int countActiveValves() {
 }
 
 // ============================================================
+// UI accessors (declared in valve_core.h)
+// ------------------------------------------------------------
+// Read-only view of valve state for the on-Giga display. These never touch the
+// serial link or the DAC buses (except vcEmergencyStop, which is a deliberate
+// safety action mirroring the 's' command).
+// ============================================================
+
+float vcValueKpa(int valve) {
+  int v = getValveValue(valve);
+  #if INPUT_PRESSURE_MODE
+    return (float)v;                 // already kPa
+  #else
+    return v * 0.06f - 100.0f;       // mV -> kPa  (0-10V => -100..500)
+  #endif
+}
+
+int vcValveOn(int valve) {
+  return getValveValue(valve) != 0 ? 1 : 0;
+}
+
+int vcActiveCount(void) {
+  return countActiveValves();
+}
+
+void vcEmergencyStop(void) {
+  allValvesOff();
+  Serial.println("EMERGENCY STOP - All valves OFF");  // keep the PC app in sync
+}
+
+// ============================================================
 // Serial Command Processing
 // ============================================================
 
@@ -357,8 +399,8 @@ void setup() {
   Serial.println(F("  32-Valve Controller (Dual-Bus)"));
   Serial.println(F("========================================"));
 
-  Wire.begin();
-  Wire1.begin();
+  Wire.begin();   // bank A: valves 0..15  (D20/D21)
+  Wire2.begin();  // bank B: valves 16..31 (D8/D9; Wire1 reserved for touch)
 
   buildMapping();
 
@@ -376,10 +418,16 @@ void setup() {
     Serial.println("Mode: VOLTAGE (mV)");
     Serial.println("Range: 0 to 10000 mV");
   #endif
-  Serial.println("Layout: V0-V15 on Wire, V16-V31 on Wire1");
+  Serial.println("Layout: V0-V15 on Wire, V16-V31 on Wire2");
   Serial.println("Commands: valve,value | s=stop | ?=status | p=ping");
+
+  // Bring up the touchscreen UI last, so valve state already reflects a clean
+  // start. ui::tick() below is non-blocking and never delays serial handling.
+  ui::begin();
+  Serial.println("Display: GIGA shield UI up (4 windows, kPa, E-STOP)");
 }
 
 void loop() {
-  processSerialCommand();
+  processSerialCommand();   // serial ALWAYS has priority, every iteration
+  ui::tick();               // cooperative, non-blocking display + touch
 }
