@@ -40,6 +40,7 @@
 
 #include "valve_core.h"   // read-only accessors exposed to the display UI
 #include "ui_display.h"   // on-Giga touchscreen UI (non-blocking)
+#include "adc_ad7606.h"   // AD7606 analog acquisition on SPI (non-blocking)
 
 #define DACS_PER_BUS 8
 #define NUM_DACS     (DACS_PER_BUS * 2)   // 16 DACs across both buses
@@ -332,6 +333,12 @@ void processSerialCommand() {
           return;
         }
 
+        if (cmdLower == "a") {
+          adc::printAll();          // dump all AD7606 channels
+          inputBuffer = "";
+          return;
+        }
+
         parseCommand(inputBuffer);
         inputBuffer = "";
       }
@@ -450,9 +457,20 @@ void setup() {
   // start. ui::tick() below is non-blocking and never delays serial handling.
   ui::begin();
   Serial.println("Display: GIGA shield UI up (4 windows, kPa, E-STOP)");
+
+  // AD7606 analog inputs on SPI. begin() reports each board present/absent.
+  adc::begin();
+  Serial.print("ADC: AD7606 up (");
+  Serial.print(ADC_NUM_BOARDS);
+  Serial.print(" board(s), ");
+  Serial.print(ADC_NUM_CH);
+  Serial.print(" ch @ ");
+  Serial.print(ADC_SAMPLE_HZ);
+  Serial.println("Hz) - type 'a' for readings");
 }
 
 void loop() {
   processSerialCommand();   // serial ALWAYS has priority, every iteration
+  adc::tick();              // cooperative, non-blocking AD7606 sampling
   ui::tick();               // cooperative, non-blocking display + touch
 }

@@ -1,0 +1,320 @@
+# AD7606 Module ↔ Arduino GIGA R1 Wiring Reference
+
+> Board labels are based on the photographed module.  
+> `RAGE` on the PCB means `RANGE`.  
+> GIGA R1 GPIO uses 3.3 V logic.
+
+## 1. AD7606 module header pinout
+
+| Left pin | Right pin | Function |
+|---|---|---|
+| `GND` | `+5V` | Ground / module power |
+| `OS1` | `OS0` | Oversampling selection |
+| `RAGE` | `OS2` | Input range / oversampling selection |
+| `CVB` | `CVA` | Conversion start B / A |
+| `RD` | `RST` | Parallel read or serial clock / reset |
+| `BUSY` | `CS` | Conversion status / active-low chip select |
+| `FRST` | `VIO` | First-data output / digital-interface supply |
+| `DB1` | `DB0` | Parallel data bits |
+| `DB3` | `DB2` | Parallel data bits |
+| `DB5` | `DB4` | Parallel data bits |
+| `DB7` | `DB6` | Parallel data; `DB7` becomes `DOUTA` in serial mode |
+| `DB9` | `DB8` | Parallel data; `DB8` becomes `DOUTB` in serial mode |
+| `DB11` | `DB10` | Parallel data bits |
+| `DB13` | `DB12` | Parallel data bits |
+| `DB15` | `DB14` | Parallel data bits; `DB15` must be low in serial mode |
+
+## 2. Common configuration for all four modules
+
+| Module pin | Connection |
+|---|---|
+| `+5V` | External regulated 5 V supply |
+| `VIO` | GIGA `3.3V` |
+| `GND` | GIGA GND and system common ground |
+| `RANGE` | `VIO/3.3V` for ±10 V range |
+| `OS0` | GND |
+| `OS1` | GND |
+| `OS2` | GND |
+| `CVA` | Tie to `CVB` |
+| `CVB` | Tie to `CVA` |
+| `FRST` | Leave unconnected initially |
+
+Configuration:
+
+```text
+Input range:   ±10 V
+Oversampling:  Off
+OS2:OS1:OS0:   000
+```
+
+Do not connect `VIO` to 5 V.
+
+---
+
+# 3. Four-module 16-bit parallel mode
+
+## Shared 16-bit data bus
+
+Connect the same data bit from all four modules together.
+
+| AD7606 pin on all four modules | Example GIGA pin |
+|---|---:|
+| `DB0` | `D22` |
+| `DB1` | `D23` |
+| `DB2` | `D24` |
+| `DB3` | `D25` |
+| `DB4` | `D26` |
+| `DB5` | `D27` |
+| `DB6` | `D28` |
+| `DB7` | `D29` |
+| `DB8` | `D30` |
+| `DB9` | `D31` |
+| `DB10` | `D32` |
+| `DB11` | `D33` |
+| `DB12` | `D34` |
+| `DB13` | `D35` |
+| `DB14` | `D36` |
+| `DB15` | `D37` |
+
+Example bus connection:
+
+```text
+AD7606 #1 DB0 ─┐
+AD7606 #2 DB0 ─┼── GIGA D22
+AD7606 #3 DB0 ─┤
+AD7606 #4 DB0 ─┘
+```
+
+Repeat for `DB1` through `DB15`.
+
+## Shared control signals
+
+| AD7606 pin on all modules | Example GIGA pin |
+|---|---:|
+| `RD` | `D38` |
+| Tied `CVA + CVB` | `D39` |
+| `RST` | `D40` |
+
+## Separate signals for each module
+
+| Function | Module 1 | Module 2 | Module 3 | Module 4 |
+|---|---:|---:|---:|---:|
+| `CS` | `D41` | `D42` | `D43` | `D44` |
+| `BUSY` | `D45` | `D46` | `D47` | `D48` |
+
+Do not connect the four `BUSY` outputs together.
+
+## Parallel acquisition sequence
+
+```text
+1. Set CS1–CS4 HIGH.
+2. Pulse the shared CVA/CVB line HIGH, then LOW.
+3. Wait until BUSY1–BUSY4 are all LOW.
+4. Set CS1 LOW.
+5. Pulse RD LOW eight times.
+6. Read DB0–DB15 as one signed 16-bit value on each pulse.
+7. Set CS1 HIGH.
+8. Repeat for CS2, CS3 and CS4.
+```
+
+```cpp
+pulseConvst();
+
+while (
+    digitalRead(BUSY1) ||
+    digitalRead(BUSY2) ||
+    digitalRead(BUSY3) ||
+    digitalRead(BUSY4)
+) {
+    // Apply a timeout.
+}
+
+for (uint8_t board = 0; board < 4; board++) {
+    digitalWrite(csPins[board], LOW);
+
+    for (uint8_t channel = 0; channel < 8; channel++) {
+        digitalWrite(rdPin, LOW);
+
+        adcValues[board * 8 + channel] =
+            static_cast<int16_t>(readParallelBus16());
+
+        digitalWrite(rdPin, HIGH);
+    }
+
+    digitalWrite(csPins[board], HIGH);
+}
+```
+
+---
+
+# 4. Four-module serial mode
+
+## Required board modification
+
+Set each module to serial/SPI mode by moving its interface-selection resistor or solder jumper:
+
+```text
+PAR / 8080  →  SER / SPI
+```
+
+Exact resistor names depend on the PCB revision.
+
+Required AD7606 mode state:
+
+```text
+PAR/SER/BYTE SEL = HIGH (move resistor)
+DB15/BYTE SEL    = LOW
+```
+
+Ground unused parallel data pins unless the module already grounds them internally:
+
+```text
+DB0–DB6  → GND
+DB9–DB15 → GND
+```
+
+Do not ground:
+
+```text
+DB7 → DOUTA
+DB8 → DOUTB
+```
+
+## Shared serial wiring
+
+| AD7606 pin on all modules | GIGA connection |
+|---|---|
+| `RD/SCLK` | GIGA SPI `SCK`, normally `D13` |
+| `DB7/DOUTA` | GIGA SPI `CIPO/MISO`, normally `D12` |
+| Tied `CVA + CVB` | Example `D39` |
+| `RST` | Example `D40` |
+| `+5V` | External regulated 5 V |
+| `VIO` | GIGA `3.3V` |
+| `GND` | Common ground |
+
+Connect all four `DB7/DOUTA` pins to the same GIGA CIPO/MISO line.
+
+Only one module may have `CS` low at a time.
+
+The original AD7606 does not require MOSI/COPI for normal hardware-mode data reading.
+
+## Separate serial signals
+
+| Function | Module 1 | Module 2 | Module 3 | Module 4 |
+|---|---:|---:|---:|---:|
+| `CS` | `D41` | `D42` | `D43` | `D44` |
+| `BUSY` | `D45` | `D46` | `D47` | `D48` |
+
+## Optional dual-output serial mode
+
+| Module pin | Serial function |
+|---|---|
+| `DB7` | `DOUTA` |
+| `DB8` | `DOUTB` |
+
+Use only `DOUTA` for the initial implementation.
+
+- One data output: 128 serial clock pulses per module
+- Two data outputs: 64 serial clock pulses per module
+
+## Serial acquisition sequence
+
+```text
+1. Set CS1–CS4 HIGH.
+2. Pulse the shared CVA/CVB line HIGH, then LOW.
+3. Wait until BUSY1–BUSY4 are all LOW.
+4. Set CS1 LOW.
+5. Read eight signed 16-bit values from DOUTA.
+6. Set CS1 HIGH.
+7. Repeat for CS2, CS3 and CS4.
+```
+
+```cpp
+pulseConvst();
+
+while (
+    digitalRead(BUSY1) ||
+    digitalRead(BUSY2) ||
+    digitalRead(BUSY3) ||
+    digitalRead(BUSY4)
+) {
+    // Apply a timeout.
+}
+
+SPI.beginTransaction(
+    SPISettings(5000000, MSBFIRST, SPI_MODE2)
+);
+
+for (uint8_t board = 0; board < 4; board++) {
+    digitalWrite(csPins[board], LOW);
+
+    for (uint8_t channel = 0; channel < 8; channel++) {
+        const uint16_t highByte = SPI.transfer(0x00);
+        const uint16_t lowByte  = SPI.transfer(0x00);
+
+        adcValues[board * 8 + channel] =
+            static_cast<int16_t>((highByte << 8) | lowByte);
+    }
+
+    digitalWrite(csPins[board], HIGH);
+}
+
+SPI.endTransaction();
+```
+
+Verify the SPI mode and clock frequency during hardware bring-up.
+
+---
+
+# 5. Raw ADC conversion
+
+For the ±10 V input range:
+
+```cpp
+float voltage =
+    static_cast<float>(raw) * 10.0f / 32768.0f;
+```
+
+| Signed raw value | Approximate voltage |
+|---:|---:|
+| `-32768` | −10 V |
+| `0` | 0 V |
+| `32767` | Nearly +10 V |
+
+---
+
+# 6. Recommended initial setup
+
+```text
+Interface:       16-bit parallel mode
+Input range:     ±10 V
+Oversampling:    Off
+VIO:             3.3 V
+Module supply:   External regulated 5 V
+CONVST:          Shared across all four modules
+Data bus:        One shared 16-bit bus
+CS:              Separate for each module
+BUSY:            Separate for each module
+FRST:            Unconnected
+```
+
+The listed GIGA GPIO numbers are an example allocation. Confirm that they do not conflict with the selected I²C buses, USB configuration, safety inputs, or other peripherals before final wiring.
+
+---
+
+# 7. Single-board bring-up wiring (serial/SPI mode)
+
+| AD7606 module pin | GIGA R1 pin |
+|---|---|
+| `SCK` (RD/SCLK) | `D13` |
+| `DOUTA` (DB7) | `D12` |
+| Tied `CVA + CVB` | `D39` |
+| `RST` | `D40` |
+| `CS` | `D41` |
+| `BUSY` | `D45` |
+| `VIO` + `RANGE` | `3.3V` |
+| `OS0` + `OS1` + `OS2` | `GND` |
+| `PAR/SER/BYTE SEL` | move resistors |
+| `DB15/BYTE SEL` | `GND` |
+| `+5V` | External regulated 5 V |
+| `GND` | GIGA `GND` / common |
