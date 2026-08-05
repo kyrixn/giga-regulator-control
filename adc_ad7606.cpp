@@ -8,13 +8,18 @@
  *                            can never hang loop())
  *   for each board: CS low, read 8 x 16-bit on DOUTA, CS high
  *
- * SPI: 5 MHz, MSB-first, mode 2 (CPOL=1, CPHA=0). Only SCK + CIPO are used;
- * MOSI is driven with dummy 0x00 bytes the AD7606 ignores.
+ * Interface: hardware SPI, 5 MHz, MSB-first, mode 2 (CPOL=1, CPHA=0) -- matches
+ * the bit-bang that proved out (SCK idle high, sample DOUTA on the falling edge).
+ * NOTE: uses the `SPI1` object, NOT `SPI`. On the GIGA R1 the D11/12/13 header
+ * pins silkscreened COPI/CIPO/SCK belong to SPI1; the default `SPI` object is
+ * routed to a different header (pins D89/D90/D91 = PG9/PD7/PB3). SCK + CIPO are
+ * the only lines used; COPI sends dummy 0x00 the AD7606 ignores.
  */
 #include "adc_ad7606.h"
 #include <SPI.h>
 
 // ---- Pin map (single-board bring-up uses index 0 of the per-board arrays) ---
+// SCK=D13, CIPO/DOUTA=D12, COPI=D11 are the fixed SPI1 pins (wired already).
 static const uint8_t PIN_CONVST = 39;   // CVA + CVB tied together
 static const uint8_t PIN_RST    = 40;
 static const uint8_t CS_PINS[4]   = { 41, 42, 43, 44 };
@@ -53,17 +58,17 @@ static void acquire() {
   pulseConvst();
   waitBusyDone();
 
-  SPI.beginTransaction(kSpi);
+  SPI1.beginTransaction(kSpi);
   for (int b = 0; b < ADC_NUM_BOARDS; b++) {
     digitalWrite(CS_PINS[b], LOW);
     for (int ch = 0; ch < ADC_CH_PER_BOARD; ch++) {
-      uint8_t hi = SPI.transfer(0x00);
-      uint8_t lo = SPI.transfer(0x00);
+      uint8_t hi = SPI1.transfer(0x00);
+      uint8_t lo = SPI1.transfer(0x00);
       g_raw[b * ADC_CH_PER_BOARD + ch] = (int16_t)(((uint16_t)hi << 8) | lo);
     }
     digitalWrite(CS_PINS[b], HIGH);
   }
-  SPI.endTransaction();
+  SPI1.endTransaction();
 
   g_seq++;
 }
@@ -80,7 +85,7 @@ void begin() {
   }
   for (int i = 0; i < ADC_NUM_CH; i++) g_raw[i] = 0;
 
-  SPI.begin();
+  SPI1.begin();   // D13 SCK / D12 CIPO / D11 COPI
 
   // Reset pulse (RESET is active high; >50ns). Ignore the first conversion.
   digitalWrite(PIN_RST, HIGH);
