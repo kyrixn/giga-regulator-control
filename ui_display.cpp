@@ -16,6 +16,7 @@
  */
 #include <Arduino.h>
 #include <stdio.h>
+#include <string.h>
 
 #include "ui_display.h"
 #include "valve_core.h"
@@ -103,9 +104,10 @@ static UiMode mode = MODE_MONITOR;
 
 static int      curGroup = 0;
 static bool     cacheValid = false;
-static float    cacheKpa[VC_GROUP_SIZE];   // monitor tile cache
+static float    cacheKpa[VC_GROUP_SIZE];    // monitor commanded cache
 static bool     cacheOn[VC_GROUP_SIZE];
-static int      cacheSbMv[VC_GROUP_SIZE];  // standalone slider cache (mV)
+static float    cacheMeasKpa[VC_GROUP_SIZE]; // monitor measured cache (real-time)
+static int      cacheSbMv[VC_GROUP_SIZE];   // standalone slider cache (mV)
 
 static int      grabbed = -1;              // slider being dragged, -1 if none
 static bool     wasTouched = false;
@@ -213,55 +215,92 @@ static void drawTopBar() {
 // ============================================================
 // Drawing — monitor tiles
 // ============================================================
+// Big real-time measured number. Redrawn on its own (partial) so sensor jitter
+// never forces a whole-tile repaint. "--" when this valve has no ADC channel.
+static void drawTileMeasured(int k) {
+  int x, y, w, h;
+  tileRect(k, x, y, w, h);
+  int v = curGroup * VC_GROUP_SIZE + k;
+
+  gfx.fillRect(x + 8, y + 52, w - 16, 52, C_PANEL);   // clear just this band
+  gfx.setTextSize(6);
+  gfx.setCursor(x + 14, y + 56);
+  if (vcHasMeasure(v)) {
+    char buf[8];
+    snprintf(buf, sizeof(buf), "%d", roundKpa(vcMeasuredKpa(v)));
+    gfx.setTextColor(C_TEXT);
+    gfx.print(buf);
+  } else {
+    gfx.setTextColor(C_TEXTDIM);
+    gfx.print("--");
+  }
+}
+
+// Bottom bar: tracks measured pressure when a sensor is present, else commanded.
+static void drawTileBar(int k) {
+  int x, y, w, h;
+  tileRect(k, x, y, w, h);
+  int v = curGroup * VC_GROUP_SIZE + k;
+  bool meas = vcHasMeasure(v);
+  float kpa = meas ? vcMeasuredKpa(v)
+                   : (vcValveOn(v) ? vcValueKpa(v) : VC_KPA_MIN);
+
+  int barX = x + 10, barW = w - 20, barY = y + h - 26, barH = 16;
+  gfx.fillRect(barX, barY, barW, barH, C_PANEL);      // clear old fill
+  gfx.drawRect(barX, barY, barW, barH, C_ACCENT_H);
+  float frac = (kpa - VC_KPA_MIN) / (VC_KPA_MAX - VC_KPA_MIN);
+  if (frac < 0) frac = 0;
+  if (frac > 1) frac = 1;
+  int fillW = (int)(frac * (barW - 2));
+  if (fillW > 0)
+    gfx.fillRect(barX + 1, barY + 1, fillW, barH - 2, meas ? C_BAR : C_BAR_DIM);
+}
+
+// Static tile layout: panel, border, valve id, small commanded setpoint, unit.
+// The dynamic parts (measured number + bar) are delegated to the helpers above.
 static void drawTile(int k) {
   int x, y, w, h;
   tileRect(k, x, y, w, h);
   int v = curGroup * VC_GROUP_SIZE + k;
   bool on = vcValveOn(v);
-  float kpa = vcValueKpa(v);
 
   uint16_t border = on ? C_ACTIVE : C_ACCENT;
   gfx.fillRect(x, y, w, h, C_PANEL);
   gfx.drawRect(x, y, w, h, border);
   gfx.drawRect(x + 1, y + 1, w - 2, h - 2, border);
 
+  // Valve id (top-left).
   gfx.setTextColor(C_TEXT);
   gfx.setTextSize(2);
   gfx.setCursor(x + 10, y + 10);
   gfx.print("V"); gfx.print(v);
 
-  if (on) {
-    char buf[12];
-    snprintf(buf, sizeof(buf), "%d", roundKpa(kpa));
-    gfx.setTextColor(C_TEXT);
-    gfx.setTextSize(4);
-    gfx.setCursor(x + 12, y + 60);
-    gfx.print(buf);
-    gfx.setTextSize(2);
-    gfx.setCursor(x + 12, y + 104);
-    gfx.print("kPa");
-  } else {
-    gfx.setTextColor(C_TEXTDIM);
-    gfx.setTextSize(4);
-    gfx.setCursor(x + 12, y + 70);
-    gfx.print("OFF");
-  }
+  // Commanded setpoint (top-right, small — same size as the id text).
+  char cbuf[16];
+  if (on) snprintf(cbuf, sizeof(cbuf), "SET %d", roundKpa(vcValueKpa(v)));
+  else    snprintf(cbuf, sizeof(cbuf), "SET OFF");
+  int cw = (int)strlen(cbuf) * 12;         // size-2 glyph is 12 px wide
+  gfx.setTextColor(on ? C_TEXT : C_TEXTDIM);
+  gfx.setCursor(x + w - 10 - cw, y + 10);
+  gfx.print(cbuf);
 
-  int barX = x + 10, barW = w - 20, barY = y + h - 26, barH = 16;
-  gfx.drawRect(barX, barY, barW, barH, C_ACCENT_H);
-  float frac = on ? (kpa - VC_KPA_MIN) / (VC_KPA_MAX - VC_KPA_MIN) : 0.0f;
-  if (frac < 0) frac = 0;
-  if (frac > 1) frac = 1;
-  int fillW = (int)(frac * (barW - 2));
-  if (fillW > 0) gfx.fillRect(barX + 1, barY + 1, fillW, barH - 2, C_BAR);
+  // Unit label under the big measured value (static).
+  gfx.setTextColor(C_TEXTDIM);
+  gfx.setTextSize(2);
+  gfx.setCursor(x + 14, y + 114);
+  gfx.print("kPa");
+
+  drawTileMeasured(k);
+  drawTileBar(k);
 }
 
 static void drawMonitorAll() {
   for (int k = 0; k < VC_GROUP_SIZE; k++) {
     drawTile(k);
     int v = curGroup * VC_GROUP_SIZE + k;
-    cacheOn[k]  = vcValveOn(v);
-    cacheKpa[k] = vcValueKpa(v);
+    cacheOn[k]      = vcValveOn(v);
+    cacheKpa[k]     = vcValueKpa(v);
+    cacheMeasKpa[k] = vcMeasuredKpa(v);
   }
 }
 
@@ -348,12 +387,18 @@ static void renderDirty() {
       int v = curGroup * VC_GROUP_SIZE + k;
       bool on = vcValveOn(v);
       float kpa = vcValueKpa(v);
-      float d = kpa - cacheKpa[k];
-      if (d < 0) d = -d;
-      if (!cacheValid || on != cacheOn[k] || d >= 1.0f) {
-        drawTile(k);
-        cacheOn[k]  = on;
-        cacheKpa[k] = kpa;
+      float meas = vcMeasuredKpa(v);
+      float dc = kpa - cacheKpa[k];       if (dc < 0) dc = -dc;
+      float dm = meas - cacheMeasKpa[k];  if (dm < 0) dm = -dm;
+      if (!cacheValid || on != cacheOn[k] || dc >= 1.0f) {
+        drawTile(k);                      // full repaint: commanded/state changed
+        cacheOn[k]      = on;
+        cacheKpa[k]     = kpa;
+        cacheMeasKpa[k] = meas;
+      } else if (dm >= 1.0f) {
+        drawTileMeasured(k);              // partial: just the live number + bar
+        drawTileBar(k);
+        cacheMeasKpa[k] = meas;
       }
     }
   }

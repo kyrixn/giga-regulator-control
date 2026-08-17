@@ -30,6 +30,12 @@ int   vcValueMv(int valve);    // current setpoint in mV (raw, voltage mode)
 int   vcValveOn(int valve);    // 1 if the valve has a non-zero setpoint, else 0
 int   vcActiveCount(void);     // number of valves currently on
 
+// Measured (real-time) output pressure from the AD7606 analog inputs. Channel
+// N reads valve N's analog output; only valves with a wired ADC channel have a
+// reading (vcHasMeasure). Same 0-10V -> kPa mapping as the DAC side.
+float vcMeasuredKpa(int valve);
+bool  vcHasMeasure(int valve);
+
 // --- Write / control (implemented in vc2.ino) ------------------------------
 void  vcSetValveMv(int valve, int mV);  // drive a valve (standalone sliders)
 void  vcEmergencyStop(void);            // all valves off + serial notice

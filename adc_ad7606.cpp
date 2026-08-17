@@ -124,8 +124,15 @@ int16_t raw(int ch) {
   return g_raw[ch];
 }
 
+// Calibration V_true = GAIN * V_measured + OFFSET, from a 5-point DMM sweep
+// (0.5-9 V) with the source and ADC grounds tied. The module over-reads ~1.5%.
+// Global (measured on one channel); per-channel constants could tighten it.
+static const float ADC_V_GAIN   = 0.9849f;
+static const float ADC_V_OFFSET = 0.0054f;
+
 float volts(int ch) {
-  return raw(ch) * (10.0f / 32768.0f);   // 0-10V signal on the +/-10V range
+  float v = raw(ch) * (10.0f / 32768.0f);   // 0-10V signal on the +/-10V range
+  return v * ADC_V_GAIN + ADC_V_OFFSET;     // apply calibration
 }
 
 uint32_t seq() { return g_seq; }

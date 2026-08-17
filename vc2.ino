@@ -271,6 +271,17 @@ int vcActiveCount(void) {
   return countActiveValves();
 }
 
+// Real-time measured pressure from the AD7606 (channel N -> valve N). The analog
+// output is 0-10V with the same mapping the DAC uses: kPa = V*60 - 100.
+bool vcHasMeasure(int valve) {
+  return valve >= 0 && valve < ADC_NUM_CH;
+}
+
+float vcMeasuredKpa(int valve) {
+  if (!vcHasMeasure(valve)) return 0.0f;
+  return adc::volts(valve) * 60.0f - 100.0f;   // 0V=>-100kPa, 10V=>500kPa
+}
+
 void vcSetValveMv(int valve, int mV) {
   setValve(valve, mV);                    // setValve clamps to the DAC range
 }
