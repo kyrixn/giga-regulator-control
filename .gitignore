@@ -1,2 +1,5 @@
 __pycache__/
 *.pyc
+
+# Local hardware-diagnostic sketches (not part of the build)
+tools/

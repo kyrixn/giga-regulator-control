@@ -1,21 +1,25 @@
 /**
  * ui_display.cpp
  *
- * On-Giga touchscreen UI. Two modes, toggled by the MODE button in the top bar:
+ * On-Giga touchscreen UI for the compact 6-valve controller.
  *
- *   MONITOR    - read-only. Mirrors PC/serial state as pressure tiles (kPa).
- *   STANDALONE - touchscreen sliders drive the regulators directly; incoming
- *                serial commands are ignored (see vcSetSerialIgnore). Sliders
- *                map their travel onto VC_SB_MV_MIN..VC_SB_MV_MAX.
+ * ONE mode: direct control. The old MONITOR/STANDALONE split is gone -- every
+ * page is live, and what used to be the MODE button is now LOCK.
+ *
+ * Layout: 2 pages of 3 regulators, chosen from the tabs in the top bar. Each
+ * regulator owns one row, split down the middle:
+ *   left  -- valve id, commanded setpoint, live measured pressure, span bar
+ *   right -- the slider that commands it
+ *
+ * LOCK gates TOUCH ONLY. Locked (the power-on state) the sliders ignore the
+ * finger, so a brush against the panel cannot pressurise anything; unlocked
+ * they drive the DACs directly. Serial is never gated -- a PC command always
+ * lands, and the slider follows it on the next redraw because the slider
+ * renders vcValueMv(), the real setpoint, rather than a position of its own.
  *
  * Design contract (see ui_display.h): ui::tick() is cooperative and
- * non-blocking. In MONITOR it never touches serial or the DAC buses; in
- * STANDALONE serial is ignored, so driving the DACs from touch is safe.
- *
- * Compact build: all 6 regulators live on one page, so the top bar carries only
- * MODE and E-STOP. The space to their left is intentionally blank -- reserved
- * for controls to be added later. The tile / slider grids keep their original
- * 4x2 and 2x4 geometry; the two trailing cells simply stay empty.
+ * non-blocking -- it returns immediately unless a millis()-gated timer is due,
+ * and even then does only a few small draws.
  *
  * Libraries: Arduino_GigaDisplay_GFX, Arduino_GigaDisplayTouch (GT911 on Wire1).
  */
@@ -48,20 +52,22 @@ static const int BAR_H    = TOPBAR_H - 2 * PAD;       // 68
 
 static const int ESTOP_W  = 152;
 static const int ESTOP_X  = SCR_W - ESTOP_W - PAD;    // 642
-static const int MODE_W   = 70;
-static const int MODE_X   = ESTOP_X - MODE_W - PAD;   // 566  (MODE button)
-// PAD .. MODE_X is left blank -- room for controls added later.
+static const int LOCK_W   = 110;
+static const int LOCK_X   = ESTOP_X - LOCK_W - PAD;   // 526
+static const int TABS_X   = PAD;                      // 6
+static const int TABS_W   = LOCK_X - PAD - TABS_X;    // 514
 
-static const int NCOL     = 4;                        // monitor tile columns
-static const int NROW     = 2;                        // monitor tile rows
-static const int TILE_TOP = TOPBAR_H + PAD;           // 86
-static const int TILES_H  = SCR_H - TILE_TOP - PAD;   // 388
+static const int NUM_PAGES = VC_NUM_VALVES / VC_GROUP_SIZE;   // 2
 
-// Standalone slider grid: 2 columns x 4 rows (last 2 cells unused with 6 valves).
-static const int SB_COLW  = (SCR_W - 3 * PAD) / 2;    // 391
-static const int SB_LX    = PAD;                      // left column x
-static const int SB_RX    = PAD + SB_COLW + PAD;      // right column x
-static const int SB_ROWH  = (TILES_H - 3 * PAD) / 4;  // 92
+// Body: VC_GROUP_SIZE rows, each split into equal left/right halves.
+static const int BODY_TOP = TOPBAR_H + PAD;                            // 86
+static const int BODY_H   = SCR_H - BODY_TOP - PAD;                    // 388
+static const int ROW_W    = SCR_W - 2 * PAD;                           // 788
+static const int ROW_H    = (BODY_H - (VC_GROUP_SIZE - 1) * PAD)
+                            / VC_GROUP_SIZE;                           // 125
+static const int HALF_W   = (ROW_W - PAD) / 2;                         // 391
+static const int LEFT_X   = PAD;                                       // 6
+static const int RIGHT_X  = PAD + HALF_W + PAD;                        // 403
 
 // ============================================================
 // Colors (RGB565)
@@ -73,14 +79,14 @@ static const uint16_t C_BG       = RGB565( 26,  26,  46);
 static const uint16_t C_PANEL    = RGB565( 22,  33,  62);
 static const uint16_t C_ACCENT   = RGB565( 15,  52,  96);
 static const uint16_t C_ACCENT_H = RGB565( 26,  68, 128);
+static const uint16_t C_TABACT   = RGB565( 30,  80, 140);
 static const uint16_t C_BAR      = RGB565( 78, 205, 196);
 static const uint16_t C_BAR_DIM  = RGB565( 40,  74,  72);
-static const uint16_t C_ACTIVE   = RGB565(  0, 255, 136);
 static const uint16_t C_TEXT     = RGB565(234, 234, 234);
 static const uint16_t C_TEXTDIM  = RGB565(136, 136, 136);
 static const uint16_t C_STOP     = RGB565(204,  42,  42);
 static const uint16_t C_STOP_H   = RGB565(255,  51,  51);
-static const uint16_t C_STAND    = RGB565(230, 150,  20);   // standalone accent
+static const uint16_t C_LIVE     = RGB565(230, 150,  20);   // unlocked accent
 static const uint16_t C_WHITE    = 0xFFFF;
 
 // ============================================================
@@ -97,17 +103,21 @@ static const uint16_t C_WHITE    = 0xFFFF;
 // leave 0 in normal use).
 #define TOUCH_DEBUG 0
 
+// Redraw hysteresis (kPa). The monitor slope is 225 kPa/V, so the same
+// electrical noise swings a lot of kPa; without this the numbers flicker.
+// Still far finer than the regulator's +/-9 kPa (VC_KPA_ACCURACY) linearity.
+static const float VC_KPA_REDRAW = 2.0f;
+
 // ============================================================
 // UI state
 // ============================================================
-enum UiMode { MODE_MONITOR = 0, MODE_STANDALONE = 1 };
-static UiMode mode = MODE_MONITOR;
+// Locked at power-on: the panel must never come up able to drive pressure.
+static bool     locked  = true;
+static int      curPage = 0;
 
 static bool     cacheValid = false;
-static float    cacheKpa[VC_GROUP_SIZE];    // monitor commanded cache
-static bool     cacheOn[VC_GROUP_SIZE];
-static float    cacheMeasKpa[VC_GROUP_SIZE]; // monitor measured cache (real-time)
-static int      cacheSbMv[VC_GROUP_SIZE];   // standalone slider cache (mV)
+static int      cacheMv[VC_GROUP_SIZE];       // commanded setpoint (mV)
+static float    cacheMeasKpa[VC_GROUP_SIZE];  // measured pressure (kPa)
 
 static int      grabbed = -1;              // slider being dragged, -1 if none
 static bool     wasTouched = false;
@@ -122,6 +132,10 @@ static int clampi(int v, int lo, int hi) {
   return v < lo ? lo : (v > hi ? hi : v);
 }
 
+static float clampf(float v, float lo, float hi) {
+  return v < lo ? lo : (v > hi ? hi : v);
+}
+
 static int roundKpa(float k) {
   return (int)(k >= 0 ? k + 0.5f : k - 0.5f);
 }
@@ -130,47 +144,64 @@ static bool inRect(int px, int py, int x, int y, int w, int h) {
   return px >= x && px < x + w && py >= y && py < y + h;
 }
 
-// --- monitor tile geometry ---
-static void tileRect(int k, int &x, int &y, int &w, int &h) {
-  int col = k % NCOL, row = k / NCOL;
-  w = (SCR_W - 2 * PAD - (NCOL - 1) * PAD) / NCOL;   // 192
-  h = (TILES_H - (NROW - 1) * PAD) / NROW;           // 191
-  x = PAD + col * (w + PAD);
-  y = TILE_TOP + row * (h + PAD);
+// Built-in GFX font advances 6*size px per character.
+static int textW(const char *s, int size) {
+  return (int)strlen(s) * 6 * size;
 }
 
-// --- standalone slider geometry ---
-static void sbCell(int k, int &x, int &y, int &w, int &h) {
-  int col = k / 4;          // 0 = left (V0-V3), 1 = right (V4, V5)
-  int row = k % 4;
-  w = SB_COLW;
-  h = SB_ROWH;
-  x = col ? SB_RX : SB_LX;
-  y = TILE_TOP + row * (h + PAD);
+// Which valve row k of the current page shows.
+static int valveOf(int k) {
+  return curPage * VC_GROUP_SIZE + k;
 }
 
-static void sbTrack(int x, int y, int w, int h,
-                    int &tx, int &ty, int &tw, int &th) {
-  tx = x + 12;
-  tw = w - 24;
-  ty = y + 44;
-  th = 30;
+static int rowY(int k) {
+  return BODY_TOP + k * (ROW_H + PAD);
+}
+
+static void tabRect(int i, int &x, int &y, int &w, int &h) {
+  w = (TABS_W - (NUM_PAGES - 1) * PAD) / NUM_PAGES;
+  h = BAR_H;
+  x = TABS_X + i * (w + PAD);
+  y = BAR_Y;
+}
+
+// The slider's active track inside the right half of row k.
+static void sliderTrack(int k, int &tx, int &ty, int &tw, int &th) {
+  int y = rowY(k);
+  tx = RIGHT_X + 16;
+  tw = HALF_W - 32;
+  ty = y + 46;
+  th = 36;
 }
 
 // ============================================================
-// Drawing — top bar
+// Drawing - top bar
 // ============================================================
-static void drawModeButton() {
-  bool sa = (mode == MODE_STANDALONE);
-  gfx.fillRect(MODE_X, BAR_Y, MODE_W, BAR_H, sa ? C_STAND : C_ACCENT);
-  gfx.drawRect(MODE_X, BAR_Y, MODE_W, BAR_H, C_ACCENT_H);
+static void drawTab(int i) {
+  int x, y, w, h;
+  tabRect(i, x, y, w, h);
+  bool active = (i == curPage);
+  gfx.fillRect(x, y, w, h, active ? C_TABACT : C_ACCENT);
+  gfx.drawRect(x, y, w, h, C_ACCENT_H);
+
+  int lo = i * VC_GROUP_SIZE, hi = lo + VC_GROUP_SIZE - 1;
+  gfx.setTextColor(active ? C_WHITE : C_TEXTDIM);
+  gfx.setTextSize(3);
+  gfx.setCursor(x + 12, y + 22);
+  gfx.print("V"); gfx.print(lo); gfx.print("-"); gfx.print(hi);
+}
+
+// LOCK gates the sliders' response to touch. Amber = live.
+static void drawLockButton() {
+  gfx.fillRect(LOCK_X, BAR_Y, LOCK_W, BAR_H, locked ? C_ACCENT : C_LIVE);
+  gfx.drawRect(LOCK_X, BAR_Y, LOCK_W, BAR_H, C_ACCENT_H);
   gfx.setTextColor(C_WHITE);
   gfx.setTextSize(1);
-  gfx.setCursor(MODE_X + 8, BAR_Y + 8);
-  gfx.print("MODE");
+  gfx.setCursor(LOCK_X + 10, BAR_Y + 10);
+  gfx.print("TOUCH");
   gfx.setTextSize(2);
-  gfx.setCursor(MODE_X + 8, BAR_Y + 28);
-  gfx.print(sa ? "CTRL" : "MON");
+  gfx.setCursor(LOCK_X + 10, BAR_Y + 32);
+  gfx.print(locked ? "LOCKED" : "LIVE");
 }
 
 static void drawEstop(bool pressed) {
@@ -182,205 +213,176 @@ static void drawEstop(bool pressed) {
 }
 
 static void drawTopBar() {
-  // Left of MODE stays empty on purpose (future controls).
-  drawModeButton();
+  for (int i = 0; i < NUM_PAGES; i++) drawTab(i);
+  drawLockButton();
   drawEstop(false);
 }
 
 // ============================================================
-// Drawing — monitor tiles
+// Drawing - left half: id, setpoint, measured pressure
 // ============================================================
-// Big real-time measured number. Redrawn on its own (partial) so sensor jitter
-// never forces a whole-tile repaint. "--" when this valve has no ADC channel.
-static void drawTileMeasured(int k) {
-  int x, y, w, h;
-  tileRect(k, x, y, w, h);
+// Valve id + commanded setpoint. Redrawn on its own whenever the setpoint
+// moves, whether that came from the slider or from a serial command.
+static void drawRowHeader(int k) {
+  int y = rowY(k);
+  int v = valveOf(k);
+  int mv = vcValueMv(v);
 
-  gfx.fillRect(x + 8, y + 52, w - 16, 52, C_PANEL);   // clear just this band
-  gfx.setTextSize(6);
-  gfx.setCursor(x + 14, y + 56);
-  if (vcHasMeasure(k)) {
-    char buf[8];
-    snprintf(buf, sizeof(buf), "%d", roundKpa(vcMeasuredKpa(k)));
-    gfx.setTextColor(C_TEXT);
-    gfx.print(buf);
-  } else {
-    gfx.setTextColor(C_TEXTDIM);
-    gfx.print("--");
-  }
-}
+  gfx.fillRect(LEFT_X + 2, y + 2, HALF_W - 4, 32, C_PANEL);
 
-// Bottom bar: tracks measured pressure when a sensor is present, else commanded.
-static void drawTileBar(int k) {
-  int x, y, w, h;
-  tileRect(k, x, y, w, h);
-  bool meas = vcHasMeasure(k);
-  float kpa = meas ? vcMeasuredKpa(k)
-                   : (vcValveOn(k) ? vcValueKpa(k) : VC_KPA_MIN);
-
-  int barX = x + 10, barW = w - 20, barY = y + h - 26, barH = 16;
-  gfx.fillRect(barX, barY, barW, barH, C_PANEL);      // clear old fill
-  gfx.drawRect(barX, barY, barW, barH, C_ACCENT_H);
-  float frac = (kpa - VC_KPA_MIN) / (VC_KPA_MAX - VC_KPA_MIN);
-  if (frac < 0) frac = 0;
-  if (frac > 1) frac = 1;
-  int fillW = (int)(frac * (barW - 2));
-  if (fillW > 0)
-    gfx.fillRect(barX + 1, barY + 1, fillW, barH - 2, meas ? C_BAR : C_BAR_DIM);
-}
-
-// Static tile layout: panel, border, valve id, small commanded setpoint, unit.
-// The dynamic parts (measured number + bar) are delegated to the helpers above.
-static void drawTile(int k) {
-  int x, y, w, h;
-  tileRect(k, x, y, w, h);
-  bool on = vcValveOn(k);
-
-  uint16_t border = on ? C_ACTIVE : C_ACCENT;
-  gfx.fillRect(x, y, w, h, C_PANEL);
-  gfx.drawRect(x, y, w, h, border);
-  gfx.drawRect(x + 1, y + 1, w - 2, h - 2, border);
-
-  // Valve id (top-left).
   gfx.setTextColor(C_TEXT);
+  gfx.setTextSize(3);
+  gfx.setCursor(LEFT_X + 12, y + 8);
+  gfx.print("V"); gfx.print(v);
+
+  char buf[20];
+  if (mv > 0) snprintf(buf, sizeof(buf), "SET %d kPa", roundKpa(vcMvToKpa(mv)));
+  else        snprintf(buf, sizeof(buf), "SET OFF");
+  gfx.setTextColor(mv > 0 ? C_TEXT : C_TEXTDIM);
   gfx.setTextSize(2);
-  gfx.setCursor(x + 10, y + 10);
-  gfx.print("V"); gfx.print(k);
-
-  // Commanded setpoint (top-right, small — same size as the id text).
-  char cbuf[16];
-  if (on) snprintf(cbuf, sizeof(cbuf), "SET %d", roundKpa(vcValueKpa(k)));
-  else    snprintf(cbuf, sizeof(cbuf), "SET OFF");
-  int cw = (int)strlen(cbuf) * 12;         // size-2 glyph is 12 px wide
-  gfx.setTextColor(on ? C_TEXT : C_TEXTDIM);
-  gfx.setCursor(x + w - 10 - cw, y + 10);
-  gfx.print(cbuf);
-
-  // Unit label under the big measured value (static).
-  gfx.setTextColor(C_TEXTDIM);
-  gfx.setTextSize(2);
-  gfx.setCursor(x + 14, y + 114);
-  gfx.print("kPa");
-
-  drawTileMeasured(k);
-  drawTileBar(k);
+  gfx.setCursor(LEFT_X + HALF_W - 12 - textW(buf, 2), y + 12);
+  gfx.print(buf);
 }
 
-static void drawMonitorAll() {
-  for (int k = 0; k < VC_GROUP_SIZE; k++) {
-    drawTile(k);
-    cacheOn[k]      = vcValveOn(k);
-    cacheKpa[k]     = vcValueKpa(k);
-    cacheMeasKpa[k] = vcMeasuredKpa(k);
+// The big live number. Its own partial redraw so sensor jitter never forces a
+// whole-row repaint. "--" when this valve has no ADC channel.
+static void drawRowMeasured(int k) {
+  int y = rowY(k);
+  int v = valveOf(k);
+
+  gfx.fillRect(LEFT_X + 2, y + 38, HALF_W - 4, 50, C_PANEL);
+
+  if (!vcHasMeasure(v)) {
+    gfx.setTextSize(6);
+    gfx.setTextColor(C_TEXTDIM);
+    gfx.setCursor(LEFT_X + 16, y + 40);
+    gfx.print("--");
+    return;
   }
+
+  char buf[12];
+  snprintf(buf, sizeof(buf), "%d", roundKpa(vcMeasuredKpa(v)));
+  gfx.setTextSize(6);
+  gfx.setTextColor(C_TEXT);
+  gfx.setCursor(LEFT_X + 16, y + 40);
+  gfx.print(buf);
+
+  gfx.setTextSize(2);
+  gfx.setTextColor(C_TEXTDIM);
+  gfx.setCursor(LEFT_X + 16 + textW(buf, 6) + 10, y + 72);
+  gfx.print("kPa");
+}
+
+// Measured pressure as a fraction of the regulator's full span.
+static void drawRowBar(int k) {
+  int y = rowY(k);
+  int v = valveOf(k);
+  bool meas = vcHasMeasure(v);
+  float kpa = meas ? vcMeasuredKpa(v) : vcValueKpa(v);
+
+  int bx = LEFT_X + 12, bw = HALF_W - 24, by = y + ROW_H - 29, bh = 16;
+  gfx.fillRect(bx, by, bw, bh, C_PANEL);
+  gfx.drawRect(bx, by, bw, bh, C_ACCENT_H);
+
+  float frac = clampf((kpa - VC_KPA_MIN) / (VC_KPA_MAX - VC_KPA_MIN), 0.0f, 1.0f);
+  int fillW = (int)(frac * (bw - 2));
+  if (fillW > 0)
+    gfx.fillRect(bx + 1, by + 1, fillW, bh - 2, meas ? C_BAR : C_BAR_DIM);
+}
+
+static void drawLeftHalf(int k) {
+  int y = rowY(k);
+  gfx.fillRect(LEFT_X, y, HALF_W, ROW_H, C_PANEL);
+  gfx.drawRect(LEFT_X, y, HALF_W, ROW_H, C_ACCENT);
+  drawRowHeader(k);
+  drawRowMeasured(k);
+  drawRowBar(k);
 }
 
 // ============================================================
-// Drawing — standalone sliders
+// Drawing - right half: the slider
 // ============================================================
 static void drawSlider(int k) {
-  int x, y, w, h;
-  sbCell(k, x, y, w, h);
-  int outMv = vcValueMv(k);
-  bool inBand = (outMv >= VC_SB_MV_MIN && outMv <= VC_SB_MV_MAX);
+  int y = rowY(k);
+  int v = valveOf(k);
+  int mv = vcValueMv(v);
 
-  gfx.fillRect(x, y, w, h, C_PANEL);
-  gfx.drawRect(x, y, w, h, inBand ? C_STAND : C_ACCENT);
+  gfx.fillRect(RIGHT_X, y, HALF_W, ROW_H, C_PANEL);
+  gfx.drawRect(RIGHT_X, y, HALF_W, ROW_H, locked ? C_ACCENT : C_LIVE);
 
-  // Label
-  gfx.setTextColor(C_TEXT);
   gfx.setTextSize(2);
-  gfx.setCursor(x + 10, y + 12);
-  gfx.print("V"); gfx.print(k);
+  gfx.setTextColor(locked ? C_TEXTDIM : C_LIVE);
+  gfx.setCursor(RIGHT_X + 16, y + 14);
+  gfx.print(locked ? "LOCKED" : "DRAG TO SET");
 
-  // Readout (kPa) — dim if the valve is off or outside the control band.
-  gfx.setTextSize(2);
-  gfx.setCursor(x + w - 128, y + 12);
-  if (outMv <= 0) {
-    gfx.setTextColor(C_TEXTDIM);
-    gfx.print("OFF");
-  } else {
-    char buf[16];
-    snprintf(buf, sizeof(buf), "%d kPa", roundKpa(outMv * 0.06f - 100.0f));
-    gfx.setTextColor(inBand ? C_TEXT : C_TEXTDIM);
-    gfx.print(buf);
-  }
-
-  // Track + fill + handle
   int tx, ty, tw, th;
-  sbTrack(x, y, w, h, tx, ty, tw, th);
+  sliderTrack(k, tx, ty, tw, th);
   gfx.drawRect(tx, ty, tw, th, C_ACCENT_H);
-  float frac = inBand
-      ? (float)(outMv - VC_SB_MV_MIN) / (float)(VC_SB_MV_MAX - VC_SB_MV_MIN)
-      : 0.0f;
+
+  float frac = clampf((float)(mv - VC_SB_MV_MIN)
+                      / (float)(VC_SB_MV_MAX - VC_SB_MV_MIN), 0.0f, 1.0f);
   int fillW = (int)(frac * (tw - 4));
   if (fillW > 0)
-    gfx.fillRect(tx + 2, ty + 2, fillW, th - 4, inBand ? C_BAR : C_BAR_DIM);
-  int hx = tx + 2 + fillW;
-  gfx.fillRect(hx - 3, ty - 5, 6, th + 10, inBand ? C_WHITE : C_TEXTDIM);
-}
+    gfx.fillRect(tx + 2, ty + 2, fillW, th - 4, locked ? C_BAR_DIM : C_BAR);
 
-static void drawStandaloneAll() {
-  // Amber frame around the main area makes the mode unmistakable.
-  gfx.drawRect(2, TILE_TOP - 2, SCR_W - 4, TILES_H + 4, C_STAND);
-  for (int k = 0; k < VC_GROUP_SIZE; k++) {
-    drawSlider(k);
-    cacheSbMv[k] = vcValueMv(k);
-  }
+  int hx = tx + 2 + fillW;
+  gfx.fillRect(hx - 4, ty - 6, 8, th + 12, locked ? C_TEXTDIM : C_WHITE);
+
+  // Band ends, so the travel's meaning is on-screen.
+  char buf[16];
+  gfx.setTextSize(1);
+  gfx.setTextColor(C_TEXTDIM);
+  gfx.setCursor(tx, ty + th + 8);
+  snprintf(buf, sizeof(buf), "%d", roundKpa(vcMvToKpa(VC_SB_MV_MIN)));
+  gfx.print(buf);
+  snprintf(buf, sizeof(buf), "%d kPa", roundKpa(vcMvToKpa(VC_SB_MV_MAX)));
+  gfx.setCursor(tx + tw - textW(buf, 1), ty + th + 8);
+  gfx.print(buf);
 }
 
 // ============================================================
 // Full repaint + dirty redraw
 // ============================================================
+static void drawRow(int k) {
+  drawLeftHalf(k);
+  drawSlider(k);
+}
+
 static void drawAll() {
   gfx.fillScreen(C_BG);
   drawTopBar();
-  if (mode == MODE_STANDALONE) drawStandaloneAll();
-  else                         drawMonitorAll();
-  cacheValid = true;
-}
-
-static void renderDirty() {
-  if (mode == MODE_STANDALONE) {
-    for (int k = 0; k < VC_GROUP_SIZE; k++) {
-      if (k == grabbed) continue;              // the drag redraws it live
-      int m = vcValueMv(k);
-      if (!cacheValid || m != cacheSbMv[k]) {  // e.g. after E-STOP
-        drawSlider(k);
-        cacheSbMv[k] = m;
-      }
-    }
-  } else {
-    for (int k = 0; k < VC_GROUP_SIZE; k++) {
-      bool on = vcValveOn(k);
-      float kpa = vcValueKpa(k);
-      float meas = vcMeasuredKpa(k);
-      float dc = kpa - cacheKpa[k];       if (dc < 0) dc = -dc;
-      float dm = meas - cacheMeasKpa[k];  if (dm < 0) dm = -dm;
-      if (!cacheValid || on != cacheOn[k] || dc >= 1.0f) {
-        drawTile(k);                      // full repaint: commanded/state changed
-        cacheOn[k]      = on;
-        cacheKpa[k]     = kpa;
-        cacheMeasKpa[k] = meas;
-      } else if (dm >= 1.0f) {
-        drawTileMeasured(k);              // partial: just the live number + bar
-        drawTileBar(k);
-        cacheMeasKpa[k] = meas;
-      }
-    }
+  for (int k = 0; k < VC_GROUP_SIZE; k++) {
+    drawRow(k);
+    int v = valveOf(k);
+    cacheMv[k]      = vcValueMv(v);
+    cacheMeasKpa[k] = vcMeasuredKpa(v);
   }
   cacheValid = true;
 }
 
-// ============================================================
-// Mode switching
-// ============================================================
-static void toggleMode() {
-  mode = (mode == MODE_MONITOR) ? MODE_STANDALONE : MODE_MONITOR;
-  vcSetSerialIgnore(mode == MODE_STANDALONE);   // ignore serial while standalone
-  grabbed = -1;
-  cacheValid = false;
-  drawAll();     // entering standalone does NOT drive any output; it only draws
+static void renderDirty() {
+  for (int k = 0; k < VC_GROUP_SIZE; k++) {
+    int v = valveOf(k);
+
+    // Setpoint moved. This is the path a serial command takes: it changed the
+    // setpoint, so the slider redraws onto the new value -- the PC always wins.
+    int mv = vcValueMv(v);
+    if (!cacheValid || mv != cacheMv[k]) {
+      cacheMv[k] = mv;
+      drawRowHeader(k);
+      if (k != grabbed) drawSlider(k);   // a live drag already repaints itself
+    }
+
+    float meas = vcMeasuredKpa(v);
+    float dm = meas - cacheMeasKpa[k];
+    if (dm < 0) dm = -dm;
+    if (!cacheValid || dm >= VC_KPA_REDRAW) {
+      cacheMeasKpa[k] = meas;
+      drawRowMeasured(k);
+      drawRowBar(k);
+    }
+  }
+  cacheValid = true;
 }
 
 // ============================================================
@@ -401,46 +403,69 @@ static void mapTouch(int tx, int ty, int &lx, int &ly) {
   ly = clampi(ay, 0, SCR_H - 1);
 }
 
-// Which slider (if any) contains the point. -1 if none.
+// Which row's slider half contains the point. -1 if none.
 static int sliderAt(int lx, int ly) {
   for (int k = 0; k < VC_GROUP_SIZE; k++) {
-    int x, y, w, h;
-    sbCell(k, x, y, w, h);
-    if (inRect(lx, ly, x, y, w, h)) return k;
+    if (inRect(lx, ly, RIGHT_X, rowY(k), HALF_W, ROW_H)) return k;
   }
   return -1;
 }
 
-// Set slider k's valve from the finger's x, redraw it live.
+// Set row k's valve from the finger's x, redraw it live.
 static void applyDrag(int k, int lx) {
-  int x, y, w, h;
-  sbCell(k, x, y, w, h);
   int tx, ty, tw, th;
-  sbTrack(x, y, w, h, tx, ty, tw, th);
-  float frac = (float)(lx - tx) / (float)tw;
-  if (frac < 0) frac = 0;
-  if (frac > 1) frac = 1;
+  sliderTrack(k, tx, ty, tw, th);
+  float frac = clampf((float)(lx - tx) / (float)tw, 0.0f, 1.0f);
   int mV = VC_SB_MV_MIN + (int)(frac * (VC_SB_MV_MAX - VC_SB_MV_MIN) + 0.5f);
-  if (mV != cacheSbMv[k]) {
-    vcSetValveMv(k, mV);
-    cacheSbMv[k] = mV;
+
+  int v = valveOf(k);
+  if (mV != vcValueMv(v)) {
+    vcSetValveMv(v, mV);
+    cacheMv[k] = mV;
     drawSlider(k);
+    drawRowHeader(k);
   }
 }
 
-// Top-bar taps (E-STOP / MODE). Returns true if handled.
+static void setPage(int p) {
+  if (p == curPage) return;
+  curPage = p;
+  grabbed = -1;
+  cacheValid = false;
+  drawAll();
+}
+
+static void toggleLock() {
+  locked = !locked;
+  grabbed = -1;
+  drawLockButton();
+  for (int k = 0; k < VC_GROUP_SIZE; k++) drawSlider(k);   // live/dim styling
+}
+
+// Top-bar taps (E-STOP / LOCK / page tabs). Returns true if handled.
 static bool handleTopBarTap(int lx, int ly) {
   if (inRect(lx, ly, ESTOP_X, BAR_Y, ESTOP_W, BAR_H)) {
     vcEmergencyStop();
+    // Re-lock: an E-STOP that leaves the sliders live could be undone by the
+    // next stray touch. renderDirty() walks the sliders back to zero.
+    if (!locked) toggleLock();
     drawEstop(true);
     estopFlashUntil = millis() + 160;
     return true;
   }
-  if (inRect(lx, ly, MODE_X, BAR_Y, MODE_W, BAR_H)) {
-    toggleMode();
+  if (inRect(lx, ly, LOCK_X, BAR_Y, LOCK_W, BAR_H)) {
+    toggleLock();
     return true;
   }
-  return false;   // the rest of the bar is blank
+  for (int i = 0; i < NUM_PAGES; i++) {
+    int x, y, w, h;
+    tabRect(i, x, y, w, h);
+    if (inRect(lx, ly, x, y, w, h)) {
+      setPage(i);
+      return true;
+    }
+  }
+  return false;
 }
 
 static void pollTouch() {
@@ -459,12 +484,12 @@ static void pollTouch() {
     if (!wasTouched) {                       // touch down
       if (ly < TOPBAR_H) {
         handleTopBarTap(lx, ly);
-      } else if (mode == MODE_STANDALONE) {
+      } else if (!locked) {                  // LOCK gates the sliders only
         grabbed = sliderAt(lx, ly);
         if (grabbed >= 0) applyDrag(grabbed, lx);
       }
     } else {                                 // touch held (drag)
-      if (mode == MODE_STANDALONE && grabbed >= 0) applyDrag(grabbed, lx);
+      if (!locked && grabbed >= 0) applyDrag(grabbed, lx);
     }
   } else {
     grabbed = -1;                            // released
@@ -481,7 +506,8 @@ void begin() {
   gfx.begin();
   gfx.setRotation(1);          // landscape 800x480
   touch.begin();               // GT911 on Wire1
-  mode = MODE_MONITOR;
+  locked  = true;
+  curPage = 0;
   grabbed = -1;
   drawAll();
 }

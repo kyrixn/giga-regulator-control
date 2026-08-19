@@ -9,13 +9,13 @@ control over 3 DACs (0x58..0x5A, 2 channels each = 6 valves):
   - Valves 0..5 on Wire (SDA/SCL)
 
 Arduino mode (set in Arduino code):
-  PRESSURE mode: input in kPa (-100 to 500)
+  PRESSURE mode: input in kPa (0 to 900)
   VOLTAGE mode:  input in mV (0 to 10000)
 
 Commands:
   Valve Control:
-    valve,value          - Set single valve: 0,3000 or 5,2100
-    v1,val1,v2,val2,...  - Set multiple valves: 0,3000,4,2500
+    valve,value          - Set single valve: 0,900 or 5,450
+    v1,val1,v2,val2,...  - Set multiple valves: 0,900,4,450
     valve,off            - Turn off a valve: 4,off
     s                    - Emergency stop (all valves off)
     ?                    - Query status of all valves
@@ -45,7 +45,16 @@ from matplotlib.animation import FuncAnimation
 NUM_VALVES = 6
 ROW_SIZE = 6
 NUM_ROWS = (NUM_VALVES + ROW_SIZE - 1) // ROW_SIZE
-MAX_INPUT_VALUE = 4000  # mV or kPa — never send values above this
+# Regulator (compact rig): command 0-10V -> 0..900 kPa; monitor 1-5V -> same
+# span. Linearity +/-1% F.S. = +/-9 kPa.
+KPA_MIN     = 0.0
+KPA_MAX     = 900.0
+CMD_MV_FS   = 10000     # command mV at KPA_MAX
+
+# SAFETY: chosen in PRESSURE and converted to mV, so revisit it whenever
+# KPA_MAX / CMD_MV_FS change. At 0.09 kPa/mV the regulator's full 10000 mV
+# would be 900 kPa; this ceiling deliberately stops at ~200 kPa.
+MAX_INPUT_VALUE = 2200  # mV or kPa — never send values above this (198 kPa)
 
 
 def bus_name(valve):
@@ -346,11 +355,11 @@ class LiveDisplay:
     def _mv_to_bar(mV):
         """Convert commanded mV to output pressure in bar.
 
-        Device maps 0-10 V to -100..500 kPa, i.e. kPa = (mV/1000)*60 - 100.
-        Then bar = kPa / 100. Clamped to >= 0 (no vacuum hardware).
+        Command side maps 0-10 V to 0..900 kPa, i.e. kPa = mV * 0.09.
+        Then bar = kPa / 100.
         """
-        bar = ((mV / 1000.0) * 60.0 - 100.0) / 100.0
-        return max(0.0, bar)
+        kpa = KPA_MIN + mV * ((KPA_MAX - KPA_MIN) / CMD_MV_FS)
+        return kpa / 100.0
 
     def _redraw_row(self, ax, v_lo, v_hi, title, snapshot):
         ax.clear()
@@ -411,8 +420,8 @@ def print_help():
 |               6-VALVE CONTROLLER - COMMANDS                      |
 +-------------------------------------------------------------------+
 |  VALVE CONTROL  (indices 0..5; all on Wire):                     |
-|    valve,value         Set single valve (e.g. 0,3000 or 20,2100)  |
-|    v1,val1,v2,val2,..  Set multiple    (e.g. 0,3000,20,2500)      |
+|    valve,value         Set single valve (e.g. 0,900 or 3,450)     |
+|    v1,val1,v2,val2,..  Set multiple    (e.g. 0,900,3,450)         |
 |    valve,off           Turn off valve  (e.g. 20,off)              |
 |    s                   EMERGENCY STOP (all valves off)            |
 |    ?                   Query status of all valves                 |
@@ -423,7 +432,7 @@ def print_help():
 |    q                   Quit program                               |
 +-------------------------------------------------------------------+
 |  Mode set in Arduino: PRESSURE (kPa) or VOLTAGE (mV)              |
-|  Python limit: values above 4000 are rejected                     |
+|  Python limit: values above 2200 are rejected (= 198 kPa)         |
 +-------------------------------------------------------------------+
 """)
 

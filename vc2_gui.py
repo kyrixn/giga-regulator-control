@@ -18,8 +18,8 @@ loop with on-figure matplotlib widgets:
 
 Layout: one row of 6 valves, all on Wire (DAC 0x58-0x5A).
 
-Values above 4000 are rejected (MAX_INPUT_VALUE in vc2_control.py).
-Arduino may allow higher; Python never sends more than 4000.
+Values above MAX_INPUT_VALUE (2200 mV = 198 kPa) are rejected; see
+vc2_control.py. The Arduino may allow higher; Python never sends more.
 
 Usage:
     python vc2_gui.py [port]
@@ -35,6 +35,7 @@ from matplotlib.widgets import TextBox, Button
 
 from vc2_control import (
     ValveController, NUM_VALVES, NUM_ROWS, ROW_SIZE, row_title,
+    MAX_INPUT_VALUE,
 )
 
 
@@ -159,7 +160,7 @@ class InteractiveDisplay:
             "Enter fires that valve (single).   "
             "Click-away keeps text but doesn't fire.   "
             "APPLY ALL fires every non-empty box in one batch.   "
-            "Max 4000.",
+            f"Max {MAX_INPUT_VALUE}.",
             fontsize=9, color=COLORS['text_dim'], fontfamily='monospace'
         )
 
@@ -316,7 +317,7 @@ class InteractiveDisplay:
                 invalid.append((valve, raw))
                 continue
 
-            if value > 4000:
+            if value > MAX_INPUT_VALUE:
                 invalid.append((valve, raw))
                 continue
 

@@ -18,7 +18,14 @@
  *              DAC 0x59 -> V2, V3
  *              DAC 0x5A -> V4, V5
  *
+ * Regulator (compact rig):
+ *   command  0-10V in  -> 0..900 kPa
+ *   monitor  1-5V  out -> 0..900 kPa   (different slope from the command side)
+ *   linearity +/-1% F.S. = +/-9 kPa
+ *
  * Analog feedback: one AD7606 board (board 0), channels 0..5 -> valves 0..5.
+ * The 1-5V monitor sits inside the ADC's +/-10V range as wired; see
+ * ADC_RANGE_V in adc_ad7606.h if the module's RANGE pin is moved to +/-5V.
  *
  * Commands (Serial @ 115200):
  *   valve,value        Set single valve: 0,3000 or 5,2100
@@ -54,12 +61,12 @@ static_assert(NUM_VALVES == VC_NUM_VALVES,
 #define INPUT_PRESSURE_MODE false
 
 // Pressure range in kPa (only used in PRESSURE mode)
-// Device mapping: 0-10V corresponds to -100 to 500 kPa
-#define PRESSURE_MIN -100
-#define PRESSURE_RANGE_MAX 500
+// Device mapping: 0-10V corresponds to 0 to 900 kPa
+#define PRESSURE_MIN 0
+#define PRESSURE_RANGE_MAX 900
 
 // Safety limit: output pressure should not exceed this value
-#define PRESSURE_SAFETY_MAX 500
+#define PRESSURE_SAFETY_MAX 900
 
 // Voltage range in mV (only used in VOLTAGE mode)
 #define VOLTAGE_MIN 0
@@ -87,11 +94,9 @@ int dacChannels[NUM_VALVES];
 // Track current value for each valve (pressure in kPa or voltage in mV)
 int currentValue[NUM_VALVES] = {0};
 
-// Serial input buffer, and a flag the display UI sets to make the serial
-// handler drain-and-discard incoming commands (standalone mode). Declared here
-// so the UI accessors below can reference them.
+// Serial input buffer. Serial is never gated -- the display's LOCK affects
+// touch only -- so there is no discard path here.
 String inputBuffer = "";
-static bool g_ignoreSerial = false;
 
 /**
  * Build the valve -> (DAC, channel) mapping.
@@ -120,17 +125,25 @@ bool initValves() {
   // Initialize each unique DAC (indices 0, 2, 4, ..., NUM_VALVES-2)
   for (int i = 0; i < NUM_VALVES; i += 2) {
     if (dacs[i]->begin() != 0) {
+      // begin() failed == no ACK at this address. Print the address so a bad
+      // jumper is distinguishable from a dead bus.
       Serial.print("ERROR: DAC init failed for valves ");
       Serial.print(i);
       Serial.print(" and ");
-      Serial.println(i + 1);
+      Serial.print(i + 1);
+      Serial.print("  (no ACK at 0x");
+      Serial.print(DAC_ADDR_BASE + i / 2, HEX);
+      Serial.println(" on Wire)");
       success = false;
     } else {
       dacs[i]->setDACOutRange(DFRobot_GP8403::eOutputRange10V);
       Serial.print("DAC initialized for valves ");
       Serial.print(i);
       Serial.print(" and ");
-      Serial.println(i + 1);
+      Serial.print(i + 1);
+      Serial.print("  (0x");
+      Serial.print(DAC_ADDR_BASE + i / 2, HEX);
+      Serial.println(")");
     }
   }
 
@@ -230,12 +243,18 @@ int countActiveValves() {
 // safety action mirroring the 's' command).
 // ============================================================
 
+// Command mV -> kPa: 0..VC_CMD_MV_FS spans VC_KPA_MIN..VC_KPA_MAX. Exposed so
+// the display can label the slider from the same formula the DAC path uses.
+float vcMvToKpa(int mV) {
+  return VC_KPA_MIN + mV * ((VC_KPA_MAX - VC_KPA_MIN) / (float)VC_CMD_MV_FS);
+}
+
 float vcValueKpa(int valve) {
   int v = getValveValue(valve);
   #if INPUT_PRESSURE_MODE
     return (float)v;                 // already kPa
   #else
-    return v * 0.06f - 100.0f;       // mV -> kPa  (0-10V => -100..500)
+    return vcMvToKpa(v);
   #endif
 }
 
@@ -251,15 +270,20 @@ int vcActiveCount(void) {
   return countActiveValves();
 }
 
-// Real-time measured pressure from the AD7606 (channel N -> valve N). The analog
-// output is 0-10V with the same mapping the DAC uses: kPa = V*60 - 100.
+// Real-time measured pressure from the AD7606 (channel N -> valve N). The
+// regulator's monitor output is 1-5V, NOT the 0-10V the command side uses, so
+// this needs its own slope: kPa = (V - 1) * 225.
 bool vcHasMeasure(int valve) {
   return valve >= 0 && valve < ADC_NUM_CH;
 }
 
 float vcMeasuredKpa(int valve) {
   if (!vcHasMeasure(valve)) return 0.0f;
-  return adc::volts(valve) * 60.0f - 100.0f;   // 0V=>-100kPa, 10V=>500kPa
+  // 1V => 0 kPa, 5V => 900 kPa. Left unclamped on purpose: a reading far below
+  // VC_KPA_MIN means the monitor line is floating, and hiding that helps no one.
+  return VC_KPA_MIN
+       + (adc::volts(valve) - VC_FB_V_MIN)
+         * ((VC_KPA_MAX - VC_KPA_MIN) / (VC_FB_V_MAX - VC_FB_V_MIN));
 }
 
 void vcSetValveMv(int valve, int mV) {
@@ -271,11 +295,37 @@ void vcEmergencyStop(void) {
   Serial.println("EMERGENCY STOP - All valves OFF");  // keep the PC app in sync
 }
 
-void vcSetSerialIgnore(bool ignore) {
-  g_ignoreSerial = ignore;
-  inputBuffer = "";
-  Serial.println(ignore ? "STANDALONE MODE - serial ignored"
-                        : "MONITOR MODE - serial active");
+// ============================================================
+// Diagnostics
+// ============================================================
+
+/**
+ * Report every address that ACKs on Wire. A DAC that fails to init is simply
+ * one that did not answer, so this says whether it is missing entirely (wiring
+ * / power / ground) or answering at an address we are not asking for (jumpers).
+ */
+void scanI2C() {
+  Serial.println("I2C scan on Wire (SDA=D20, SCL=D21):");
+  int found = 0;
+  for (uint8_t addr = 0x08; addr < 0x78; addr++) {
+    Wire.beginTransmission(addr);
+    if (Wire.endTransmission() == 0) {
+      found++;
+      Serial.print("  0x");
+      Serial.print(addr, HEX);
+      if (addr >= DAC_ADDR_BASE && addr < DAC_ADDR_BASE + 8) {
+        Serial.print("  (DAC range");
+        if (addr < DAC_ADDR_BASE + NUM_DACS) Serial.print(", expected");
+        else                                 Serial.print(", NOT used by this build");
+        Serial.print(")");
+      }
+      Serial.println();
+    }
+  }
+  if (found == 0)
+    Serial.println("  nothing responded - check SDA=D20/SCL=D21, power, common ground");
+  Serial.print("  expected 0x58..0x");
+  Serial.println(DAC_ADDR_BASE + NUM_DACS - 1, HEX);
 }
 
 // ============================================================
@@ -293,12 +343,6 @@ void vcSetSerialIgnore(bool ignore) {
 void processSerialCommand() {
   while (Serial.available()) {
     char c = Serial.read();
-
-    // Standalone mode: keep the RX buffer drained but ignore the content.
-    if (g_ignoreSerial) {
-      inputBuffer = "";
-      continue;
-    }
 
     if (c == '\n' || c == '\r') {
       if (inputBuffer.length() > 0) {
@@ -326,6 +370,12 @@ void processSerialCommand() {
 
         if (cmdLower == "a") {
           adc::printAll();          // dump all AD7606 channels
+          inputBuffer = "";
+          return;
+        }
+
+        if (cmdLower == "i") {
+          scanI2C();                // which addresses actually answer
           inputBuffer = "";
           return;
         }
@@ -430,23 +480,25 @@ void setup() {
     Serial.println("All DACs initialized successfully!");
   } else {
     Serial.println("WARNING: Some DACs failed to initialize");
+    scanI2C();      // show what IS on the bus, so the gap is obvious
   }
 
   #if INPUT_PRESSURE_MODE
     Serial.println("Mode: PRESSURE (kPa)");
-    Serial.println("Device range: -100 to 500 kPa (0-10V)");
-    Serial.println("Safety limit: -100 to 500 kPa");
+    Serial.println("Device range: 0 to 900 kPa (0-10V command)");
+    Serial.println("Safety limit: 0 to 900 kPa");
   #else
     Serial.println("Mode: VOLTAGE (mV)");
     Serial.println("Range: 0 to 10000 mV");
   #endif
   Serial.println("Layout: V0-V5 on Wire (DAC 0x58-0x5A)");
-  Serial.println("Commands: valve,value | s=stop | ?=status | p=ping");
+  Serial.println("Regulator: cmd 0-10V = 0-900 kPa | monitor 1-5V = 0-900 kPa");
+  Serial.println("Commands: valve,value | s=stop | ?=status | p=ping | i=I2C scan");
 
   // Bring up the touchscreen UI last, so valve state already reflects a clean
   // start. ui::tick() below is non-blocking and never delays serial handling.
   ui::begin();
-  Serial.println("Display: GIGA shield UI up (kPa, E-STOP)");
+  Serial.println("Display: GIGA shield UI up (2 pages x 3 valves, LOCK, E-STOP)");
 
   // AD7606 analog inputs on SPI. begin() reports each board present/absent.
   adc::begin();

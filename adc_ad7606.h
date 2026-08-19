@@ -14,8 +14,10 @@
  * and even then a full sweep costs only ~50us/board. Call it AFTER
  * processSerialCommand() so serial always keeps priority.
  *
- * Signals are 0-10V, measured on the AD7606's bipolar +/-10V range, so the raw
- * code lands in 0..32767 and volts() = raw * 10 / 32768.
+ * The regulators' pressure-monitor outputs are 1-5V, measured on the AD7606's
+ * bipolar range selected by the module's RANGE ("RAGE") pin -- see ADC_RANGE_V.
+ * The raw code is twos-complement, so a 1-5V signal lands well inside 0..32767
+ * and volts() = raw * ADC_RANGE_V / 32768.
  */
 #pragma once
 #include <Arduino.h>
@@ -26,6 +28,17 @@
 #define ADC_CH_PER_BOARD 8
 #define ADC_NUM_CH       (ADC_NUM_BOARDS * ADC_CH_PER_BOARD)
 
+// Full-scale of the bipolar input range, set in HARDWARE by the module's RANGE
+// ("RAGE") pin -- there is no software control of it:
+//   RANGE -> VIO/3.3V  =>  +/-10V  =>  ADC_RANGE_V 10.0f   (as wired today)
+//   RANGE -> GND       =>  +/- 5V  =>  ADC_RANGE_V  5.0f
+// A 1-5V monitor signal fits either way. Moving to +/-5V halves the quantisation
+// step (0.069 -> 0.034 kPa), which is far below the regulator's own +/-9 kPa
+// linearity, so it is optional. If you do rewire it, re-run the DMM sweep that
+// produced ADC_V_GAIN / ADC_V_OFFSET in adc_ad7606.cpp -- those were measured
+// on the +/-10V range.
+#define ADC_RANGE_V      10.0f
+
 // Background sample rate (Hz): tick() re-samples every board at this cadence.
 #define ADC_SAMPLE_HZ    200
 
@@ -33,7 +46,7 @@ namespace adc {
   void     begin();            // init SPI + pins, reset the AD7606(s), probe presence
   void     tick();             // non-blocking; acquires a sweep when the timer is due
   int16_t  raw(int ch);        // latest signed raw code, channel 0..ADC_NUM_CH-1
-  float    volts(int ch);      // latest voltage (0-10V range) for a channel
+  float    volts(int ch);      // latest voltage for a channel (see ADC_RANGE_V)
   uint32_t seq();              // increments once per completed sweep
   bool     present(int board); // BUSY toggled during begin()'s probe
   void     printAll();         // dump every channel to Serial (the 'a' command)
