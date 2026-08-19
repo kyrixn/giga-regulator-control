@@ -108,6 +108,12 @@ static const uint16_t C_WHITE    = 0xFFFF;
 // Still far finer than the regulator's +/-9 kPa (VC_KPA_ACCURACY) linearity.
 static const float VC_KPA_REDRAW = 2.0f;
 
+// LOCK re-arm delay (ms). handleTopBarTap() fires on the touch-down edge, so a
+// momentary GT911 dropout mid-press reads as a second press and toggles LOCK
+// straight back. Ignoring repeat presses for this long swallows the bounce.
+// Only LOCK needs it: E-STOP and the page tabs are idempotent, a toggle is not.
+static const uint32_t LOCK_REARM_MS = 500;
+
 // ============================================================
 // UI state
 // ============================================================
@@ -124,6 +130,7 @@ static bool     wasTouched = false;
 static uint32_t lastTouchMs = 0;
 static uint32_t lastDrawMs  = 0;
 static uint32_t estopFlashUntil = 0;
+static uint32_t lastLockMs  = 0;           // last accepted LOCK press
 
 // ============================================================
 // Small helpers
@@ -448,14 +455,19 @@ static bool handleTopBarTap(int lx, int ly) {
     vcEmergencyStop();
     // Re-lock: an E-STOP that leaves the sliders live could be undone by the
     // next stray touch. renderDirty() walks the sliders back to zero.
-    if (!locked) toggleLock();
+    if (!locked) { lastLockMs = millis(); toggleLock(); }
     drawEstop(true);
     estopFlashUntil = millis() + 160;
     return true;
   }
   if (inRect(lx, ly, LOCK_X, BAR_Y, LOCK_W, BAR_H)) {
-    toggleLock();
-    return true;
+    // Subtraction (not now >= deadline) so this survives millis() rollover.
+    uint32_t now = millis();
+    if ((uint32_t)(now - lastLockMs) >= LOCK_REARM_MS) {
+      lastLockMs = now;
+      toggleLock();
+    }
+    return true;      // swallowed either way; never falls through to a slider
   }
   for (int i = 0; i < NUM_PAGES; i++) {
     int x, y, w, h;
