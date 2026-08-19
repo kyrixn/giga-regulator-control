@@ -1,35 +1,30 @@
 /**
  * vc2.ino
  *
- * 32-Valve Controller (Feedforward) for Arduino Giga R1 - dual I2C bus.
+ * 6-Valve Controller (Feedforward) for Arduino Giga R1 - compact build.
  *
  * Hardware:
- *   Wire  (SDA/SCL,   D20/D21): 8 GP8403 DACs at 0x58..0x5F -> valves 0..15
- *   Wire2 (SDA2/SCL2, D8/D9):   8 GP8403 DACs at 0x58..0x5F -> valves 16..31
+ *   Wire (SDA/SCL, D20/D21): 3 GP8403 DACs at 0x58..0x5A -> valves 0..5
  *   DAC output: 0-10V   (2 channels per DAC -> 2 valves per DAC)
  *
- *   NOTE: bank B is on Wire2 (not Wire1) so Wire1 is left free for the GIGA
- *   Display Shield's GT911 touch controller (0x5D on Wire1, which would clash
- *   with a DAC). Wire2 has NO internal pull-ups -- the DAC boards' on-board
- *   pull-ups usually suffice; add ~4.7k to 3V3 on D8/D9 if the bus is flaky.
+ *   Only the default I2C bus is used. Wire1 belongs to the GIGA Display
+ *   Shield's GT911 touch controller (0x5D, which would clash with a DAC);
+ *   Wire2 is unused in this build.
  *
- * 16 DACs total (8 per bus), 32 regulators total.
+ * 3 DACs total, 6 regulators total.
  *
  * Valve-to-DAC mapping (2 channels per DAC):
- *   Bus Wire   DAC 0x58 -> V0 ,V1     Bus Wire2  DAC 0x58 -> V16,V17
- *              DAC 0x59 -> V2 ,V3                DAC 0x59 -> V18,V19
- *              DAC 0x5A -> V4 ,V5                DAC 0x5A -> V20,V21
- *              DAC 0x5B -> V6 ,V7                DAC 0x5B -> V22,V23
- *              DAC 0x5C -> V8 ,V9                DAC 0x5C -> V24,V25
- *              DAC 0x5D -> V10,V11               DAC 0x5D -> V26,V27
- *              DAC 0x5E -> V12,V13               DAC 0x5E -> V28,V29
- *              DAC 0x5F -> V14,V15               DAC 0x5F -> V30,V31
+ *   Bus Wire   DAC 0x58 -> V0, V1
+ *              DAC 0x59 -> V2, V3
+ *              DAC 0x5A -> V4, V5
+ *
+ * Analog feedback: one AD7606 board (board 0), channels 0..5 -> valves 0..5.
  *
  * Commands (Serial @ 115200):
- *   valve,value        Set single valve: 0,3000 or 20,2100
- *   v1,val1,v2,val2,.. Set multiple valves: 0,3000,20,2500
- *   valve,off          Turn off a valve: 20,off
- *   s                  Emergency stop (all 32 valves off)
+ *   valve,value        Set single valve: 0,3000 or 5,2100
+ *   v1,val1,v2,val2,.. Set multiple valves: 0,3000,4,2500
+ *   valve,off          Turn off a valve: 4,off
+ *   s                  Emergency stop (all 6 valves off)
  *   ?                  Query status of all valves
  *   p                  Ping test
  */
@@ -42,14 +37,13 @@
 #include "ui_display.h"   // on-Giga touchscreen UI (non-blocking)
 #include "adc_ad7606.h"   // AD7606 analog acquisition on SPI (non-blocking)
 
-#define DACS_PER_BUS 8
-#define NUM_DACS     (DACS_PER_BUS * 2)   // 16 DACs across both buses
-#define NUM_VALVES   (NUM_DACS * 2)       // 32 valves (2 channels per DAC)
+#define NUM_DACS     3                    // 0x58..0x5A on Wire
+#define NUM_VALVES   (NUM_DACS * 2)       // 6 valves (2 channels per DAC)
 
 static_assert(NUM_VALVES == VC_NUM_VALVES,
               "valve_core.h VC_NUM_VALVES must match NUM_VALVES");
 
-// First contiguous I2C address of the DACs on each bus (0x58..0x5F).
+// First contiguous I2C address of the DACs on the bus (0x58..0x5A).
 #define DAC_ADDR_BASE 0x58
 
 // ============================================================
@@ -74,23 +68,14 @@ static_assert(NUM_VALVES == VC_NUM_VALVES,
 // ============================================================
 // DAC instances
 // ============================================================
-// One object per physical DAC. Bus 0 (Wire) drives valves 0..15,
-// bus 1 (Wire2) drives valves 16..31. Addresses run 0x58..0x5F on
-// each bus. Wire1 is intentionally NOT used here -- it belongs to the
-// display shield's touch controller.
+// One object per physical DAC, all on the default bus (Wire) driving
+// valves 0..5. Addresses run 0x58..0x5A. Wire1 is intentionally NOT used
+// here -- it belongs to the display shield's touch controller.
 
-DFRobot_GP8403 dacBus0[DACS_PER_BUS] = {
-  DFRobot_GP8403(&Wire, DAC_ADDR_BASE + 0), DFRobot_GP8403(&Wire, DAC_ADDR_BASE + 1),
-  DFRobot_GP8403(&Wire, DAC_ADDR_BASE + 2), DFRobot_GP8403(&Wire, DAC_ADDR_BASE + 3),
-  DFRobot_GP8403(&Wire, DAC_ADDR_BASE + 4), DFRobot_GP8403(&Wire, DAC_ADDR_BASE + 5),
-  DFRobot_GP8403(&Wire, DAC_ADDR_BASE + 6), DFRobot_GP8403(&Wire, DAC_ADDR_BASE + 7)
-};
-
-DFRobot_GP8403 dacBus1[DACS_PER_BUS] = {
-  DFRobot_GP8403(&Wire2, DAC_ADDR_BASE + 0), DFRobot_GP8403(&Wire2, DAC_ADDR_BASE + 1),
-  DFRobot_GP8403(&Wire2, DAC_ADDR_BASE + 2), DFRobot_GP8403(&Wire2, DAC_ADDR_BASE + 3),
-  DFRobot_GP8403(&Wire2, DAC_ADDR_BASE + 4), DFRobot_GP8403(&Wire2, DAC_ADDR_BASE + 5),
-  DFRobot_GP8403(&Wire2, DAC_ADDR_BASE + 6), DFRobot_GP8403(&Wire2, DAC_ADDR_BASE + 7)
+DFRobot_GP8403 dacBus0[NUM_DACS] = {
+  DFRobot_GP8403(&Wire, DAC_ADDR_BASE + 0),
+  DFRobot_GP8403(&Wire, DAC_ADDR_BASE + 1),
+  DFRobot_GP8403(&Wire, DAC_ADDR_BASE + 2)
 };
 
 // Mapping arrays: valve index -> DAC pointer and channel.
@@ -110,18 +95,13 @@ static bool g_ignoreSerial = false;
 
 /**
  * Build the valve -> (DAC, channel) mapping.
- *   valves 0..15  -> dacBus0[0..7], channels 0/1
- *   valves 16..31 -> dacBus1[0..7], channels 0/1
+ *   valves 0..5 -> dacBus0[0..2], channels 0/1
  */
 void buildMapping() {
-  for (int d = 0; d < DACS_PER_BUS; d++) {
-    int v0 = d * 2;                 // bus 0 valves 0..15
-    dacs[v0]     = &dacBus0[d]; dacChannels[v0]     = 0;
-    dacs[v0 + 1] = &dacBus0[d]; dacChannels[v0 + 1] = 1;
-
-    int v1 = 16 + d * 2;            // bus 1 valves 16..31
-    dacs[v1]     = &dacBus1[d]; dacChannels[v1]     = 0;
-    dacs[v1 + 1] = &dacBus1[d]; dacChannels[v1 + 1] = 1;
+  for (int d = 0; d < NUM_DACS; d++) {
+    int v = d * 2;
+    dacs[v]     = &dacBus0[d]; dacChannels[v]     = 0;
+    dacs[v + 1] = &dacBus0[d]; dacChannels[v + 1] = 1;
   }
 }
 
@@ -165,7 +145,7 @@ bool initValves() {
 /**
  * Set valve output
  *
- * @param valve Valve index (0-31)
+ * @param valve Valve index (0-5)
  * @param value Pressure in kPa (if INPUT_PRESSURE_MODE) or voltage in mV (if not)
  * @return true if successful, false if invalid valve index
  */
@@ -304,7 +284,7 @@ void vcSetSerialIgnore(bool ignore) {
 
 /**
  * Process serial commands
- * Format: valve,pressure  e.g. 0,3000 or 20,2100
+ * Format: valve,pressure  e.g. 0,3000 or 5,2100
  * Special commands:
  *   s or S - Emergency stop (all valves off)
  *   ?      - Print status of all valves
@@ -439,11 +419,10 @@ void setup() {
   delay(1000);
 
   Serial.println(F("\n========================================"));
-  Serial.println(F("  32-Valve Controller (Dual-Bus)"));
+  Serial.println(F("  6-Valve Controller (Compact)"));
   Serial.println(F("========================================"));
 
-  Wire.begin();   // bank A: valves 0..15  (D20/D21)
-  Wire2.begin();  // bank B: valves 16..31 (D8/D9; Wire1 reserved for touch)
+  Wire.begin();   // valves 0..5 on the default bus (D20/D21)
 
   buildMapping();
 
@@ -461,13 +440,13 @@ void setup() {
     Serial.println("Mode: VOLTAGE (mV)");
     Serial.println("Range: 0 to 10000 mV");
   #endif
-  Serial.println("Layout: V0-V15 on Wire, V16-V31 on Wire2");
+  Serial.println("Layout: V0-V5 on Wire (DAC 0x58-0x5A)");
   Serial.println("Commands: valve,value | s=stop | ?=status | p=ping");
 
   // Bring up the touchscreen UI last, so valve state already reflects a clean
   // start. ui::tick() below is non-blocking and never delays serial handling.
   ui::begin();
-  Serial.println("Display: GIGA shield UI up (4 windows, kPa, E-STOP)");
+  Serial.println("Display: GIGA shield UI up (kPa, E-STOP)");
 
   // AD7606 analog inputs on SPI. begin() reports each board present/absent.
   adc::begin();

@@ -1,12 +1,13 @@
 /**
  * adc_ad7606.h
  *
- * AD7606 analog-input acquisition for the 32-valve station (serial/SPI mode).
+ * AD7606 analog-input acquisition for the compact 6-valve station (serial/SPI
+ * mode).
  *
- * Four 8-channel AD7606 boards share one SPI bus (SCK + DOUTA), a common
- * CONVST and RST, and have a per-board CS and BUSY. Nothing else on the Giga
- * uses SPI (display = MIPI-DSI, touch = Wire1, DACs = Wire/Wire2), so the ADCs
- * own the bus outright.
+ * Each 8-channel AD7606 board shares one SPI bus (SCK + DOUTA), a common
+ * CONVST and RST, and has a per-board CS and BUSY. Nothing else on the Giga
+ * uses SPI (display = MIPI-DSI, touch = Wire1, DACs = Wire), so the ADCs own
+ * the bus outright.  This build wires board 0 only, channels 0..5 -> V0..V5.
  *
  * Design contract (mirrors ui_display): adc::tick() is cooperative and
  * non-blocking -- it returns immediately unless its millis()-gated timer is due,
@@ -19,8 +20,8 @@
 #pragma once
 #include <Arduino.h>
 
-// Boards wired. Start at 1 for single-board bring-up; set to 4 for the full
-// 32-channel setup (CS pins D41..D44, BUSY pins D45..D48).
+// Boards wired. Compact build uses board 0 only (CS D41, BUSY D45); the driver
+// still clocks out all 8 of its channels, of which 0..5 map to V0..V5.
 #define ADC_NUM_BOARDS   1
 #define ADC_CH_PER_BOARD 8
 #define ADC_NUM_CH       (ADC_NUM_BOARDS * ADC_CH_PER_BOARD)

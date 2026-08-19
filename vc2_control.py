@@ -2,12 +2,11 @@
 """
 vc2_control.py
 
-32-Valve Controller - Serial Communication Script with Matplotlib Display
+6-Valve Controller - Serial Communication Script with Matplotlib Display
 
-Controls Arduino vc2 sketch for direct voltage/pressure control over 16 DACs
-(8 per I2C bus, 2 channels each = 32 valves):
-  - Valves  0..15  on Wire   (SDA/SCL)
-  - Valves 16..31  on Wire1  (SDA1/SCL1)
+Controls Arduino vc2 sketch (compact build) for direct voltage/pressure
+control over 3 DACs (0x58..0x5A, 2 channels each = 6 valves):
+  - Valves 0..5 on Wire (SDA/SCL)
 
 Arduino mode (set in Arduino code):
   PRESSURE mode: input in kPa (-100 to 500)
@@ -15,9 +14,9 @@ Arduino mode (set in Arduino code):
 
 Commands:
   Valve Control:
-    valve,value          - Set single valve: 0,3000 or 9,2100
-    v1,val1,v2,val2,...  - Set multiple valves: 0,3000,9,2500
-    valve,off            - Turn off a valve: 9,off
+    valve,value          - Set single valve: 0,3000 or 5,2100
+    v1,val1,v2,val2,...  - Set multiple valves: 0,3000,4,2500
+    valve,off            - Turn off a valve: 4,off
     s                    - Emergency stop (all valves off)
     ?                    - Query status of all valves
 
@@ -43,16 +42,15 @@ import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
 
 
-NUM_VALVES = 32
-ROW_SIZE = 8
+NUM_VALVES = 6
+ROW_SIZE = 6
 NUM_ROWS = (NUM_VALVES + ROW_SIZE - 1) // ROW_SIZE
-BUS_SPLIT = 16          # valves 0..15 -> Wire, 16..31 -> Wire1
 MAX_INPUT_VALUE = 4000  # mV or kPa — never send values above this
 
 
 def bus_name(valve):
-    """Return the I2C bus label for a valve index."""
-    return 'Wire' if valve < BUS_SPLIT else 'Wire1'
+    """Return the I2C bus label for a valve index (single bus in this build)."""
+    return 'Wire'
 
 
 def row_title(v_lo, v_hi):
@@ -61,7 +59,7 @@ def row_title(v_lo, v_hi):
 
 
 class ValveController:
-    """32-Valve serial interface with matplotlib display"""
+    """6-Valve serial interface with matplotlib display"""
 
     def __init__(self, port=None, baudrate=115200):
         self.ser = None
@@ -280,7 +278,7 @@ class ValveController:
 
 
 class LiveDisplay:
-    """Matplotlib display: 32 valves in 4 rows of 8 (V0-V15 Wire, V16-V31 Wire1)"""
+    """Matplotlib display: 6 valves in one row (V0-V5 on Wire)"""
 
     def __init__(self, controller):
         self.controller = controller
@@ -305,12 +303,12 @@ class LiveDisplay:
 
         self.fig = plt.figure(figsize=(13, 2 + 2.2 * NUM_ROWS),
                               facecolor=self.colors['bg'])
-        self.fig.canvas.manager.set_window_title('32-Valve Controller')
+        self.fig.canvas.manager.set_window_title('6-Valve Controller')
 
         gs = self.fig.add_gridspec(NUM_ROWS, 1, hspace=0.55,
                                    left=0.07, right=0.97, top=0.92, bottom=0.06)
 
-        self.fig.suptitle('32-Valve Controller (Dual-Bus)', fontsize=18,
+        self.fig.suptitle('6-Valve Controller (Compact)', fontsize=18,
                           color=self.colors['text'], fontweight='bold',
                           fontfamily='monospace')
 
@@ -410,9 +408,9 @@ class LiveDisplay:
 def print_help():
     print("""
 +-------------------------------------------------------------------+
-|              32-VALVE CONTROLLER - COMMANDS                       |
+|               6-VALVE CONTROLLER - COMMANDS                      |
 +-------------------------------------------------------------------+
-|  VALVE CONTROL  (indices 0..31; 0-15 = Wire, 16-31 = Wire1):      |
+|  VALVE CONTROL  (indices 0..5; all on Wire):                     |
 |    valve,value         Set single valve (e.g. 0,3000 or 20,2100)  |
 |    v1,val1,v2,val2,..  Set multiple    (e.g. 0,3000,20,2500)      |
 |    valve,off           Turn off valve  (e.g. 20,off)              |
@@ -534,7 +532,7 @@ def main():
     port = sys.argv[1] if len(sys.argv) > 1 else None
 
     print("=" * 65)
-    print("      32-VALVE CONTROLLER (Dual-Bus, Feedforward)")
+    print("      6-VALVE CONTROLLER (Compact, Feedforward)")
     print("=" * 65)
 
     controller = ValveController(port)

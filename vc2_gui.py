@@ -2,11 +2,11 @@
 """
 vc2_gui.py
 
-Interactive GUI for the vc2 32-valve controller. Reuses the serial layer
+Interactive GUI for the vc2 6-valve controller. Reuses the serial layer
 from vc2_control.py (ValveController) and replaces the terminal input
 loop with on-figure matplotlib widgets:
 
-  - One TextBox under each bar (V0..V31):
+  - One TextBox under each bar (V0..V5):
         * Type a number + Enter to set that valve immediately
         * Type "off" (or o/x) + Enter to turn that valve off
         * Clicking away does NOT submit — the typed text stays in the box
@@ -16,7 +16,7 @@ loop with on-figure matplotlib widgets:
   - ? STATUS button: query all valve states
   - PING button: ping the Arduino
 
-Layout: 4 rows of 8 valves. V0-V15 are on Wire, V16-V31 on Wire1.
+Layout: one row of 6 valves, all on Wire (DAC 0x58-0x5A).
 
 Values above 4000 are rejected (MAX_INPUT_VALUE in vc2_control.py).
 Arduino may allow higher; Python never sends more than 4000.
@@ -87,7 +87,7 @@ class InteractiveDisplay:
         self.fig = None
         self.ani = None
         self.axes = []             # one bar-plot axis per row, top to bottom
-        self.textboxes = []        # list of TextBox, indexed by valve id (0..31)
+        self.textboxes = []        # list of TextBox, indexed by valve id (0..5)
         self.status_text = None
         self.msg_text = None
         self.recent_msgs = []
@@ -112,7 +112,7 @@ class InteractiveDisplay:
         self.fig = plt.figure(figsize=(15, 2.4 + 2.1 * NUM_ROWS),
                               facecolor=COLORS['bg'])
         try:
-            self.fig.canvas.manager.set_window_title('32-Valve Controller (Interactive)')
+            self.fig.canvas.manager.set_window_title('6-Valve Controller (Interactive)')
         except Exception:
             pass
 
@@ -124,7 +124,7 @@ class InteractiveDisplay:
         self.fig.canvas.mpl_connect('key_press_event', self._on_key_press)
 
         self.fig.suptitle(
-            '32-Valve Controller  (Interactive)',
+            '6-Valve Controller  (Interactive)',
             fontsize=17, color=COLORS['text'], fontweight='bold',
             fontfamily='monospace', y=0.985
         )
@@ -453,7 +453,7 @@ def main():
     port = sys.argv[1] if len(sys.argv) > 1 else None
 
     print("=" * 65)
-    print("   32-VALVE CONTROLLER (Interactive GUI)")
+    print("   6-VALVE CONTROLLER (Interactive GUI)")
     print("=" * 65)
 
     controller = ValveController(port)
