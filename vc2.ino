@@ -123,6 +123,15 @@ void buildMapping() {
     dacs[v1]     = &dacBus1[d]; dacChannels[v1]     = 0;
     dacs[v1 + 1] = &dacBus1[d]; dacChannels[v1 + 1] = 1;
   }
+
+  // Assembly fix: the DAC channels for pairs 26/27, 28/29, 30/31 were cross-
+  // wired to their regulators (each pair shares one DAC: 0x5D/0x5E/0x5F on
+  // Wire2). Swap the channel so a command for valve N reaches regulator N.
+  static const int swapPairs[3][2] = { {26, 27}, {28, 29}, {30, 31} };
+  for (int i = 0; i < 3; i++) {
+    int a = swapPairs[i][0], b = swapPairs[i][1];
+    int t = dacChannels[a]; dacChannels[a] = dacChannels[b]; dacChannels[b] = t;
+  }
 }
 
 // ============================================================
