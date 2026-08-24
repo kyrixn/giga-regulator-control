@@ -184,13 +184,13 @@ DB8 → DOUTB
 
 | AD7606 pin on all modules | GIGA connection |
 |---|---|
-| `RD/SCLK` | GIGA SPI `SCK`, normally `D13` |
-| `DB7/DOUTA` | GIGA SPI `CIPO/MISO`, normally `D12` |
-| Tied `CVA + CVB` | Example `D39` |
-| `RST` | Example `D40` |
-| `+5V` | External regulated 5 V |
-| `VIO` | GIGA `3.3V` |
-| `GND` | Common ground |
+| `RD/SCLK *5` green black | GIGA SPI `SCK`, normally `D13` |
+| `DB7/DOUTA *5` yellow black | GIGA SPI `CIPO/MISO`, normally `D12` |
+| Tied `CVA + CVB` *10 green purp | Example `D39` |
+| `RST` *5 purp | Example `D40` |
+| `+5V`*5 red | External regulated 5 V |
+| `VIO` * 10 white | GIGA `3.3V` |
+| `GND` * 22 | Common ground |
 
 Connect all four `DB7/DOUTA` pins to the same GIGA CIPO/MISO line.
 
@@ -313,8 +313,6 @@ The listed GIGA GPIO numbers are an example allocation. Confirm that they do not
 | `CS` | `D41` |
 | `BUSY` | `D45` |
 | `VIO` + `RANGE` | `3.3V` |
-| `OS0` + `OS1` + `OS2` | `GND` |
+| `OS0` + `OS1` + `OS2` + `DB15/BYTE SEL` + `GND` | `GND` |
 | `PAR/SER/BYTE SEL` | move resistors |
-| `DB15/BYTE SEL` | `GND` |
 | `+5V` | External regulated 5 V |
-| `GND` | GIGA `GND` / common |
