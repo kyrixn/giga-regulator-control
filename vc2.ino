@@ -62,6 +62,8 @@
 
 static_assert(NUM_VALVES == VC_NUM_VALVES,
               "valve_core.h VC_NUM_VALVES must match NUM_VALVES");
+static_assert(DV_NUM_VALVES == VC_NUM_ONOFF,
+              "valve_core.h VC_NUM_ONOFF must match DV_NUM_VALVES");
 
 // First contiguous I2C address of the DACs on the bus (0x58..0x5A).
 #define DAC_ADDR_BASE 0x58
@@ -306,6 +308,20 @@ float vcMeasuredKpa(int valve) {
 
 void vcSetValveMv(int valve, int mV) {
   setValve(valve, mV);                    // setValve clamps to the DAC range
+}
+
+// On/off solenoids, page 3 of the display. Thin pass-throughs to dv:: so
+// ui_display.cpp needs no hardware header -- same boundary the regulators use.
+bool vcOnOffGet(int idx) {
+  return dv::get(idx);
+}
+
+int vcOnOffPin(int idx) {
+  return dv::pin(idx);
+}
+
+void vcOnOffSet(int idx, bool on) {
+  dv::set(idx, on);                       // dv::set ignores a bad index
 }
 
 void vcEmergencyStop(void) {
@@ -623,7 +639,7 @@ void setup() {
   // Bring up the touchscreen UI last, so valve state already reflects a clean
   // start. ui::tick() below is non-blocking and never delays serial handling.
   ui::begin();
-  Serial.println("Display: GIGA shield UI up (2 pages x 3 valves, LOCK, E-STOP)");
+  Serial.println("Display: GIGA shield UI up (2 reg pages + on/off page, LOCK, E-STOP)");
 
   // AD7606 analog inputs on SPI. begin() reports each board present/absent.
   adc::begin();

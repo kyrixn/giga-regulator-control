@@ -49,6 +49,13 @@ bool get(int valve) {
   return g_on[valve];
 }
 
+// The index is not the pin number (index 0 is D2), and the UI labels its
+// buttons with both, so the mapping is published rather than duplicated.
+int pin(int valve) {
+  if (valve < 0 || valve >= DV_NUM_VALVES) return -1;
+  return DV_PINS[valve];
+}
+
 void allOff() {
   for (int i = 0; i < DV_NUM_VALVES; i++) set(i, false);
 }

@@ -57,9 +57,24 @@ int   vcActiveCount(void);     // number of valves currently on
 float vcMeasuredKpa(int valve);
 bool  vcHasMeasure(int valve);
 
+// --- On/off solenoids ------------------------------------------------------
+// Six 2-position valves on their own driver board (valves_onoff.h), shown on
+// the display's third page as a grid of toggles. Kept behind these accessors
+// for the same reason as the regulators: ui_display.cpp includes no hardware
+// header and cannot reach the driver except through this interface.
+//
+// NOTE the numbering. These are indices 0..VC_NUM_ONOFF-1, mapping onto Giga
+// pins D2..D7, so index 0 is pin D2 -- vcOnOffPin() exists so the UI can label
+// a button with both and never imply the index is the pin.
+static const int VC_NUM_ONOFF = 6;
+
+bool vcOnOffGet(int idx);
+int  vcOnOffPin(int idx);
+
 // --- Write / control (implemented in vc2.ino) ------------------------------
 // Serial is never gated: a PC command always lands, and the touchscreen slider
 // follows it because the slider renders vcValueMv() rather than a position of
 // its own. The UI's LOCK gates the touchscreen only.
 void  vcSetValveMv(int valve, int mV);  // drive a valve (touchscreen sliders)
-void  vcEmergencyStop(void);            // all valves off + serial notice
+void  vcOnOffSet(int idx, bool on);     // drive a solenoid (touchscreen toggles)
+void  vcEmergencyStop(void);            // ALL valves off (both kinds) + notice

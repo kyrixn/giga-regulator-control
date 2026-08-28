@@ -33,6 +33,7 @@ namespace dv {
   void begin();                  // park every channel OFF, then drive the pins
   bool set(int valve, bool on);  // false on a bad index
   bool get(int valve);           // last commanded state (no readback on the board)
+  int  pin(int valve);           // Giga GPIO behind an index, -1 if out of range
   void allOff();
   int  activeCount();
   void printStatus();            // the 'd?' command

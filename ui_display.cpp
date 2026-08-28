@@ -6,16 +6,18 @@
  * ONE mode: direct control. The old MONITOR/STANDALONE split is gone -- every
  * page is live, and what used to be the MODE button is now LOCK.
  *
- * Layout: 2 pages of 3 regulators, chosen from the tabs in the top bar. Each
- * regulator owns one row, split down the middle:
- *   left  -- valve id, commanded setpoint, live measured pressure, span bar
- *   right -- the slider that commands it
+ * Layout: 3 pages, chosen from the tabs in the top bar.
+ *   pages 0-1  three regulators each, one per row, split down the middle:
+ *                left  -- valve id, setpoint, live measured pressure, span bar
+ *                right -- the slider that commands it
+ *   page 2     the six on/off solenoids as a 3x2 grid of toggle buttons
  *
- * LOCK gates TOUCH ONLY. Locked (the power-on state) the sliders ignore the
- * finger, so a brush against the panel cannot pressurise anything; unlocked
- * they drive the DACs directly. Serial is never gated -- a PC command always
- * lands, and the slider follows it on the next redraw because the slider
- * renders vcValueMv(), the real setpoint, rather than a position of its own.
+ * LOCK gates TOUCH ONLY, on every page. Locked (the power-on state) the sliders
+ * and the toggles both ignore the finger, so a brush against the panel cannot
+ * pressurise anything or fire a solenoid; unlocked they drive the hardware
+ * directly. Serial is never gated -- a PC command always lands, and the widgets
+ * follow it on the next redraw because they render the real state (vcValueMv(),
+ * vcOnOffGet()) rather than a position of their own.
  *
  * Design contract (see ui_display.h): ui::tick() is cooperative and
  * non-blocking -- it returns immediately unless a millis()-gated timer is due,
@@ -57,7 +59,15 @@ static const int LOCK_X   = ESTOP_X - LOCK_W - PAD;   // 526
 static const int TABS_X   = PAD;                      // 6
 static const int TABS_W   = LOCK_X - PAD - TABS_X;    // 514
 
-static const int NUM_PAGES = VC_NUM_VALVES / VC_GROUP_SIZE;   // 2
+// Two regulator pages, then one page of on/off solenoids.
+static const int NUM_REG_PAGES = VC_NUM_VALVES / VC_GROUP_SIZE;   // 2
+static const int SOL_PAGE      = NUM_REG_PAGES;                   // 2
+static const int NUM_PAGES     = NUM_REG_PAGES + 1;               // 3
+
+// The solenoid page reuses the regulator rows' geometry exactly: VC_GROUP_SIZE
+// rows of two half-width buttons.
+static_assert(VC_NUM_ONOFF == VC_GROUP_SIZE * 2,
+              "the on/off page lays VC_NUM_ONOFF out as VC_GROUP_SIZE rows of 2");
 
 // Body: VC_GROUP_SIZE rows, each split into equal left/right halves.
 static const int BODY_TOP = TOPBAR_H + PAD;                            // 86
@@ -87,6 +97,8 @@ static const uint16_t C_TEXTDIM  = RGB565(136, 136, 136);
 static const uint16_t C_STOP     = RGB565(204,  42,  42);
 static const uint16_t C_STOP_H   = RGB565(255,  51,  51);
 static const uint16_t C_LIVE     = RGB565(230, 150,  20);   // unlocked accent
+static const uint16_t C_SOL_ON   = RGB565(  0, 168,  92);   // solenoid energised
+static const uint16_t C_SOL_DIM  = RGB565( 18,  74,  48);   // ...but locked
 static const uint16_t C_WHITE    = 0xFFFF;
 
 // ============================================================
@@ -108,11 +120,12 @@ static const uint16_t C_WHITE    = 0xFFFF;
 // Still far finer than the regulator's +/-9 kPa (VC_KPA_ACCURACY) linearity.
 static const float VC_KPA_REDRAW = 2.0f;
 
-// LOCK re-arm delay (ms). handleTopBarTap() fires on the touch-down edge, so a
-// momentary GT911 dropout mid-press reads as a second press and toggles LOCK
-// straight back. Ignoring repeat presses for this long swallows the bounce.
-// Only LOCK needs it: E-STOP and the page tabs are idempotent, a toggle is not.
-static const uint32_t LOCK_REARM_MS = 500;
+// Toggle re-arm delay (ms). Taps fire on the touch-down edge, so a momentary
+// GT911 dropout mid-press reads as a second press and undoes the first.
+// Ignoring a repeat press of the SAME control for this long swallows the
+// bounce. Only toggles need it -- E-STOP and the page tabs are idempotent, so
+// a doubled tap there is harmless; LOCK and the solenoid buttons are not.
+static const uint32_t TOGGLE_REARM_MS = 500;
 
 // ============================================================
 // UI state
@@ -124,6 +137,7 @@ static int      curPage = 0;
 static bool     cacheValid = false;
 static int      cacheMv[VC_GROUP_SIZE];       // commanded setpoint (mV)
 static float    cacheMeasKpa[VC_GROUP_SIZE];  // measured pressure (kPa)
+static bool     cacheSol[VC_NUM_ONOFF];       // solenoid states (page SOL_PAGE)
 
 static int      grabbed = -1;              // slider being dragged, -1 if none
 static bool     wasTouched = false;
@@ -131,6 +145,8 @@ static uint32_t lastTouchMs = 0;
 static uint32_t lastDrawMs  = 0;
 static uint32_t estopFlashUntil = 0;
 static uint32_t lastLockMs  = 0;           // last accepted LOCK press
+static uint32_t lastSolMs   = 0;           // last accepted solenoid press...
+static int      lastSolIdx  = -1;          // ...and which button it was
 
 // ============================================================
 // Small helpers
@@ -172,6 +188,15 @@ static void tabRect(int i, int &x, int &y, int &w, int &h) {
   y = BAR_Y;
 }
 
+// Button i on the solenoid page: VC_GROUP_SIZE rows of two, reading
+// left-to-right then down, so d0..d5 land where the eye expects them.
+static void solRect(int i, int &x, int &y, int &w, int &h) {
+  x = (i % 2) ? RIGHT_X : LEFT_X;
+  y = rowY(i / 2);
+  w = HALF_W;
+  h = ROW_H;
+}
+
 // The slider's active track inside the right half of row k.
 static void sliderTrack(int k, int &tx, int &ty, int &tw, int &th) {
   int y = rowY(k);
@@ -191,11 +216,15 @@ static void drawTab(int i) {
   gfx.fillRect(x, y, w, h, active ? C_TABACT : C_ACCENT);
   gfx.drawRect(x, y, w, h, C_ACCENT_H);
 
-  int lo = i * VC_GROUP_SIZE, hi = lo + VC_GROUP_SIZE - 1;
   gfx.setTextColor(active ? C_WHITE : C_TEXTDIM);
   gfx.setTextSize(3);
   gfx.setCursor(x + 12, y + 22);
-  gfx.print("V"); gfx.print(lo); gfx.print("-"); gfx.print(hi);
+  if (i == SOL_PAGE) {
+    gfx.print("ON/OFF");
+  } else {
+    int lo = i * VC_GROUP_SIZE, hi = lo + VC_GROUP_SIZE - 1;
+    gfx.print("V"); gfx.print(lo); gfx.print("-"); gfx.print(hi);
+  }
 }
 
 // LOCK gates the sliders' response to touch. Amber = live.
@@ -348,6 +377,45 @@ static void drawSlider(int k) {
 }
 
 // ============================================================
+// Drawing - the on/off solenoid page
+// ============================================================
+static void drawSolButton(int i) {
+  int x, y, w, h;
+  solRect(i, x, y, w, h);
+  bool on = vcOnOffGet(i);
+
+  // Energised is green, dimmed while locked -- the same live/locked language
+  // the sliders use, so the lock state reads the same on every page.
+  gfx.fillRect(x, y, w, h, on ? (locked ? C_SOL_DIM : C_SOL_ON) : C_PANEL);
+  gfx.drawRect(x, y, w, h, locked ? C_ACCENT : C_LIVE);
+
+  gfx.setTextColor(C_TEXT);
+  gfx.setTextSize(3);
+  gfx.setCursor(x + 14, y + 12);
+  gfx.print("d"); gfx.print(i);
+
+  // The index is NOT the pin number (d0 drives D2), so the button carries both
+  // and there is nothing left to misremember at the panel.
+  char buf[12];
+  snprintf(buf, sizeof(buf), "pin D%d", vcOnOffPin(i));
+  gfx.setTextColor(C_TEXTDIM);
+  gfx.setTextSize(1);
+  gfx.setCursor(x + 16, y + 42);
+  gfx.print(buf);
+
+  const char *state = on ? "ON" : "OFF";
+  gfx.setTextSize(5);
+  gfx.setTextColor(on ? C_WHITE : C_TEXTDIM);
+  gfx.setCursor(x + w - 20 - textW(state, 5), y + h / 2 - 20);
+  gfx.print(state);
+
+  gfx.setTextSize(1);
+  gfx.setTextColor(locked ? C_TEXTDIM : C_LIVE);
+  gfx.setCursor(x + 16, y + h - 18);
+  gfx.print(locked ? "LOCKED" : "TAP TO TOGGLE");
+}
+
+// ============================================================
 // Full repaint + dirty redraw
 // ============================================================
 static void drawRow(int k) {
@@ -358,16 +426,38 @@ static void drawRow(int k) {
 static void drawAll() {
   gfx.fillScreen(C_BG);
   drawTopBar();
-  for (int k = 0; k < VC_GROUP_SIZE; k++) {
-    drawRow(k);
-    int v = valveOf(k);
-    cacheMv[k]      = vcValueMv(v);
-    cacheMeasKpa[k] = vcMeasuredKpa(v);
+  if (curPage == SOL_PAGE) {
+    for (int i = 0; i < VC_NUM_ONOFF; i++) {
+      drawSolButton(i);
+      cacheSol[i] = vcOnOffGet(i);
+    }
+  } else {
+    for (int k = 0; k < VC_GROUP_SIZE; k++) {
+      drawRow(k);
+      int v = valveOf(k);
+      cacheMv[k]      = vcValueMv(v);
+      cacheMeasKpa[k] = vcMeasuredKpa(v);
+    }
   }
   cacheValid = true;
 }
 
 static void renderDirty() {
+  if (curPage == SOL_PAGE) {
+    // Serial 'd' commands and the E-STOP both change these behind the UI's
+    // back, so the buttons chase the real state exactly as the sliders chase
+    // vcValueMv(). The PC always wins here too.
+    for (int i = 0; i < VC_NUM_ONOFF; i++) {
+      bool on = vcOnOffGet(i);
+      if (!cacheValid || on != cacheSol[i]) {
+        cacheSol[i] = on;
+        drawSolButton(i);
+      }
+    }
+    cacheValid = true;
+    return;
+  }
+
   for (int k = 0; k < VC_GROUP_SIZE; k++) {
     int v = valveOf(k);
 
@@ -418,6 +508,31 @@ static int sliderAt(int lx, int ly) {
   return -1;
 }
 
+// Which solenoid button contains the point. -1 if none.
+static int solAt(int lx, int ly) {
+  for (int i = 0; i < VC_NUM_ONOFF; i++) {
+    int x, y, w, h;
+    solRect(i, x, y, w, h);
+    if (inRect(lx, ly, x, y, w, h)) return i;
+  }
+  return -1;
+}
+
+// Toggle solenoid i, unless this is the same button bouncing. Tracking which
+// button was last pressed (not just when) keeps the guard from blocking a
+// deliberate quick run across different valves.
+static void tapSolenoid(int i) {
+  uint32_t now = millis();
+  if (i == lastSolIdx && (uint32_t)(now - lastSolMs) < TOGGLE_REARM_MS) return;
+  lastSolIdx = i;
+  lastSolMs  = now;
+
+  bool on = !vcOnOffGet(i);
+  vcOnOffSet(i, on);
+  cacheSol[i] = vcOnOffGet(i);
+  drawSolButton(i);
+}
+
 // Set row k's valve from the finger's x, redraw it live.
 static void applyDrag(int k, int lx) {
   int tx, ty, tw, th;
@@ -446,7 +561,12 @@ static void toggleLock() {
   locked = !locked;
   grabbed = -1;
   drawLockButton();
-  for (int k = 0; k < VC_GROUP_SIZE; k++) drawSlider(k);   // live/dim styling
+  // Repaint the body for the live/dim styling -- whichever body is showing.
+  if (curPage == SOL_PAGE) {
+    for (int i = 0; i < VC_NUM_ONOFF; i++) drawSolButton(i);
+  } else {
+    for (int k = 0; k < VC_GROUP_SIZE; k++) drawSlider(k);
+  }
 }
 
 // Top-bar taps (E-STOP / LOCK / page tabs). Returns true if handled.
@@ -463,7 +583,7 @@ static bool handleTopBarTap(int lx, int ly) {
   if (inRect(lx, ly, LOCK_X, BAR_Y, LOCK_W, BAR_H)) {
     // Subtraction (not now >= deadline) so this survives millis() rollover.
     uint32_t now = millis();
-    if ((uint32_t)(now - lastLockMs) >= LOCK_REARM_MS) {
+    if ((uint32_t)(now - lastLockMs) >= TOGGLE_REARM_MS) {
       lastLockMs = now;
       toggleLock();
     }
@@ -496,9 +616,14 @@ static void pollTouch() {
     if (!wasTouched) {                       // touch down
       if (ly < TOPBAR_H) {
         handleTopBarTap(lx, ly);
-      } else if (!locked) {                  // LOCK gates the sliders only
-        grabbed = sliderAt(lx, ly);
-        if (grabbed >= 0) applyDrag(grabbed, lx);
+      } else if (!locked) {                  // LOCK gates the body, not serial
+        if (curPage == SOL_PAGE) {
+          int i = solAt(lx, ly);
+          if (i >= 0) tapSolenoid(i);
+        } else {
+          grabbed = sliderAt(lx, ly);
+          if (grabbed >= 0) applyDrag(grabbed, lx);
+        }
       }
     } else {                                 // touch held (drag)
       if (!locked && grabbed >= 0) applyDrag(grabbed, lx);

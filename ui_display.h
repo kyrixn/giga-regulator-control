@@ -2,13 +2,16 @@
  * ui_display.h
  *
  * On-Giga touchscreen UI for the compact 6-valve controller (Arduino GIGA
- * Display Shield, 800x480 landscape). Two pages of 3 regulators, chosen from
- * the top bar, which also carries LOCK and an always-visible E-STOP. Each row
- * shows a regulator's setpoint and live pressure on the left and the slider
- * that commands it on the right.
+ * Display Shield, 800x480 landscape). Three pages, chosen from the top bar,
+ * which also carries LOCK and an always-visible E-STOP:
+ *   V0-2, V3-5  three regulators each. Every row shows a regulator's setpoint
+ *               and live pressure on the left, the slider commanding it on the
+ *               right.
+ *   ON/OFF      the six on/off solenoids as a 3x2 grid of toggle buttons.
  *
- * LOCK gates the touchscreen only; serial commands are never gated and always
- * win, with the sliders redrawing to follow them.
+ * LOCK gates the touchscreen only -- sliders and toggles alike. Serial commands
+ * are never gated and always win, with both widget kinds redrawing to follow
+ * them.
  *
  * Design contract: ui::tick() is cooperative and non-blocking -- it returns
  * immediately unless a millis()-gated timer is due, and even then does only a
