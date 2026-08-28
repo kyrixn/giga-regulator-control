@@ -23,17 +23,29 @@
  *   monitor  1-5V  out -> 0..900 kPa   (different slope from the command side)
  *   linearity +/-1% F.S. = +/-9 kPa
  *
+ * On/off valves: six 2-position solenoids on D2..D7 through an 8-channel
+ * opto-isolated MOSFET board (see valves_onoff.h). Independent of the
+ * regulators above; addressed with 'd' commands.
+ *
  * Analog feedback: one AD7606 board (board 0), channels 0..5 -> valves 0..5.
  * The 1-5V monitor sits inside the ADC's +/-10V range as wired; see
  * ADC_RANGE_V in adc_ad7606.h if the module's RANGE pin is moved to +/-5V.
  *
  * Commands (Serial @ 115200):
- *   valve,value        Set single valve: 0,3000 or 5,2100
- *   v1,val1,v2,val2,.. Set multiple valves: 0,3000,4,2500
- *   valve,off          Turn off a valve: 4,off
- *   s                  Emergency stop (all 6 valves off)
- *   ?                  Query status of all valves
+ *   Proportional regulators (bare index 0..5, value in mV 0..10000):
+ *     valve,value        Set one:       0,3000
+ *     v1,val1,v2,val2,.. Set several:   0,3000,4,2500
+ *     valve,off          Release one:   4,off
+ *     ?                  Status of all 6 regulators
+ *   On/off valves ('d' prefix, index 0..5 -> D2..D7):
+ *     dN,V               Set one:       d0,1  d0,on  d0,0  d0,off
+ *     dN,V,dM,V,..       Set several:   d0,1,d3,0
+ *     d,off              Release all on/off valves
+ *     d  or  d?          Status of all 6 on/off valves
+ *   s                  Emergency stop (regulators AND on/off valves)
  *   p                  Ping test
+ *   a                  Dump every AD7606 channel
+ *   i                  I2C bus scan
  */
 
 #include <Arduino.h>
@@ -43,6 +55,7 @@
 #include "valve_core.h"   // read-only accessors exposed to the display UI
 #include "ui_display.h"   // on-Giga touchscreen UI (non-blocking)
 #include "adc_ad7606.h"   // AD7606 analog acquisition on SPI (non-blocking)
+#include "valves_onoff.h" // six 2-position solenoids on D2..D7 (GPIO only)
 
 #define NUM_DACS     3                    // 0x58..0x5A on Wire
 #define NUM_VALVES   (NUM_DACS * 2)       // 6 valves (2 channels per DAC)
@@ -199,12 +212,17 @@ void valveOff(int valve) {
 }
 
 /**
- * Turn off all valves
+ * Turn off all valves -- regulators AND on/off solenoids.
+ *
+ * Every stop path funnels through here (the 's' command, vcEmergencyStop() for
+ * the touchscreen E-STOP), so putting dv::allOff() in this one place is what
+ * makes an emergency stop actually stop everything.
  */
 void allValvesOff() {
   for (int i = 0; i < NUM_VALVES; i++) {
     valveOff(i);
   }
+  dv::allOff();
 }
 
 /**
@@ -380,6 +398,27 @@ void processSerialCommand() {
           return;
         }
 
+        if (cmdLower == "d" || cmdLower == "d?") {
+          dv::printStatus();
+          inputBuffer = "";
+          return;
+        }
+
+        if (cmdLower == "d,off") {
+          dv::allOff();
+          Serial.println("OK: all on/off valves OFF");
+          inputBuffer = "";
+          return;
+        }
+
+        // Any other line starting with 'd' is an on/off-valve command. Checked
+        // before parseCommand() so "d0,1" can never be read as regulator 0.
+        if (cmdLower.length() > 1 && cmdLower[0] == 'd') {
+          parseDigitalCommand(inputBuffer);
+          inputBuffer = "";
+          return;
+        }
+
         parseCommand(inputBuffer);
         inputBuffer = "";
       }
@@ -442,6 +481,81 @@ void parseCommand(String cmd) {
 }
 
 /**
+ * Parse an on/off-valve line: dN,V where V is 1/0/on/off. Several pairs may
+ * share a line: d0,1,d3,0
+ *
+ * The 'd' rides on the index token rather than the line as a whole, so a mixed
+ * or malformed line still names the valve it is talking about, and a dropped
+ * character cannot silently turn "d0,1" into regulator 0 at 1 mV.
+ */
+void parseDigitalCommand(String cmd) {
+  cmd.trim();
+
+  int start = 0;
+  int count = 0;
+
+  while (start < (int)cmd.length()) {
+    int comma1 = cmd.indexOf(',', start);
+    if (comma1 == -1) break;
+
+    String idxTok = cmd.substring(start, comma1);
+    idxTok.trim();
+    if (idxTok.length() > 0 && (idxTok[0] == 'd' || idxTok[0] == 'D')) {
+      idxTok = idxTok.substring(1);
+    }
+    int valve = idxTok.toInt();
+
+    int comma2 = cmd.indexOf(',', comma1 + 1);
+    String valTok;
+    if (comma2 == -1) {
+      valTok = cmd.substring(comma1 + 1);
+      start = cmd.length();
+    } else {
+      valTok = cmd.substring(comma1 + 1, comma2);
+      start = comma2 + 1;
+    }
+    valTok.trim();
+
+    // Strict: an unrecognised token is rejected, not coerced. toInt() would
+    // turn any typo into 0 == OFF, which is safe but silent, and a command
+    // that looks accepted while doing nothing is worse than one that errors.
+    bool on;
+    if (valTok == "1" || valTok.equalsIgnoreCase("on")) {
+      on = true;
+    } else if (valTok == "0" || valTok.equalsIgnoreCase("off")) {
+      on = false;
+    } else {
+      Serial.print("ERROR: D");
+      Serial.print(valve);
+      Serial.print(" bad value '");
+      Serial.print(valTok);
+      Serial.println("' - use 0/1/on/off");
+      count++;
+      continue;
+    }
+
+    if (dv::set(valve, on)) {
+      Serial.print("OK: D");
+      Serial.print(valve);
+      Serial.print("=");
+      Serial.print(on ? 1 : 0);
+    } else {
+      Serial.print("ERROR: Invalid on/off valve index ");
+      Serial.print(valve);
+    }
+
+    count++;
+    if (start < (int)cmd.length()) Serial.print(" | ");
+  }
+
+  if (count > 0) {
+    Serial.println();
+  } else {
+    Serial.println("ERROR: Use dN,V with V = 0/1/on/off, e.g. d0,1");
+  }
+}
+
+/**
  * Print status of all valves
  */
 void printStatus() {
@@ -466,6 +580,13 @@ void printStatus() {
 
 void setup() {
   Serial.begin(115200);
+
+  // First, ahead of the 1s serial settle and every bus bring-up: park the six
+  // on/off solenoids. Until pinMode() runs, D2..D7 are inputs and the driver
+  // board's own pull-ups hold the channels off, so the sooner this claims the
+  // pins at the OFF level the shorter the window in which anything else could.
+  dv::begin();
+
   delay(1000);
 
   Serial.println(F("\n========================================"));
@@ -493,7 +614,11 @@ void setup() {
   #endif
   Serial.println("Layout: V0-V5 on Wire (DAC 0x58-0x5A)");
   Serial.println("Regulator: cmd 0-10V = 0-900 kPa | monitor 1-5V = 0-900 kPa");
-  Serial.println("Commands: valve,value | s=stop | ?=status | p=ping | i=I2C scan");
+  Serial.print("On/off valves: D0-D5 on pins D2-D7, all OFF (driver active-");
+  Serial.print(DV_ACTIVE_LOW ? "LOW" : "HIGH");
+  Serial.println(")");
+  Serial.println("Commands: valve,value | dN,0|1 | s=stop | ?=status | d?=on/off status");
+  Serial.println("          p=ping | a=ADC dump | i=I2C scan");
 
   // Bring up the touchscreen UI last, so valve state already reflects a clean
   // start. ui::tick() below is non-blocking and never delays serial handling.

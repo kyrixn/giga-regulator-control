@@ -13,12 +13,19 @@ Arduino mode (set in Arduino code):
   VOLTAGE mode:  input in mV (0 to 10000)
 
 Commands:
-  Valve Control:
+  Proportional regulators (indices 0..5):
     valve,value          - Set single valve: 0,900 or 5,450
     v1,val1,v2,val2,...  - Set multiple valves: 0,900,4,450
     valve,off            - Turn off a valve: 4,off
-    s                    - Emergency stop (all valves off)
-    ?                    - Query status of all valves
+    ?                    - Query status of all regulators
+
+  On/off solenoids (indices 0..5 == Giga pins D2..D7):
+    dN,V                 - Set one: d0,1  d0,on  d0,0  d0,off
+    dN,V,dM,V,...        - Set several: d0,1,d3,0
+    d,off                - Release every on/off valve
+    d  or  d?            - Query status of all on/off valves
+
+  s                      - Emergency stop (regulators AND solenoids)
 
   Info:
     p                    - Ping test
@@ -56,6 +63,13 @@ CMD_MV_FS   = 10000     # command mV at KPA_MAX
 # would be 900 kPa; this ceiling deliberately stops at ~200 kPa.
 MAX_INPUT_VALUE = 2200  # mV or kPa — never send values above this (198 kPa)
 
+# On/off solenoids on the opto-isolated MOSFET board. NOTE the numbering: these
+# are indices 0..5, matching the regulators' 0..5, and they map onto Giga pins
+# D2..D7. So 'd0' drives pin D2 and 'd5' drives pin D7 -- the index is not the
+# pin number. Firmware side: DV_NUM_VALVES / DV_PINS in valves_onoff.h/.cpp.
+NUM_ONOFF   = 6
+ONOFF_PIN0  = 2         # index 0 -> D2, for display labels only
+
 
 def bus_name(valve):
     """Return the I2C bus label for a valve index (single bus in this build)."""
@@ -78,6 +92,10 @@ class ValveController:
 
         # Valve readings (commanded mV)
         self.valve_data = {}  # {valve_id: mV}
+
+        # On/off solenoid states, {index: bool}. Absent == not yet known; the
+        # board offers no readback, so this only ever reflects acks we saw.
+        self.onoff_data = {}
 
         # Display lock
         self.display_lock = threading.Lock()
@@ -166,6 +184,16 @@ class ValveController:
                 with self.display_lock:
                     self.valve_data.pop(v, None)
 
+            # "D<i>=<0|1>" -> on/off solenoid ack. Deliberately a separate
+            # letter from V so neither regex can ever match the other's acks.
+            for m in re.findall(r'D(\d+)=([01])', line):
+                with self.display_lock:
+                    self.onoff_data[int(m[0])] = (m[1] == '1')
+
+            if "all on/off valves OFF" in line:
+                with self.display_lock:
+                    self.onoff_data = {i: False for i in range(NUM_ONOFF)}
+
             self.message_queue.append(line)
             return
 
@@ -182,9 +210,20 @@ class ValveController:
             self.message_queue.append(line)
             return
 
+        # On/off status response: "D0=0 | D1=1 | ... | D5=0"
+        if line.startswith("D") and "=" in line and "|" in line:
+            with self.display_lock:
+                self.onoff_data = {
+                    int(m[0]): (m[1] == '1')
+                    for m in re.findall(r'D(\d+)=([01])', line)
+                }
+            self.message_queue.append(line)
+            return
+
         if line.startswith("EMERGENCY"):
             with self.display_lock:
                 self.valve_data.clear()
+                self.onoff_data = {i: False for i in range(NUM_ONOFF)}
             self.message_queue.append(f"** {line} **")
             return
 
@@ -201,7 +240,10 @@ class ValveController:
             return
 
         # Boot banner / info messages
-        if (line.startswith("Mode:")
+        if (line.startswith("On/off valves")
+                or line.startswith("Display:")
+                or line.startswith("ADC:")
+                or line.startswith("Mode:")
                 or line.startswith("Range:")
                 or line.startswith("Device")
                 or line.startswith("Layout:")
@@ -262,10 +304,37 @@ class ValveController:
             self.valve_data.pop(valve, None)
         return self.send(f"{valve},off")
 
+    def set_onoff(self, pairs):
+        """Set one or more on/off solenoids.
+
+        pairs: list of (index, bool). Sent as a single 'd0,1,d3,0' line so the
+        valves switch in one pass of the firmware's command parser rather than
+        staggered across several serial round-trips.
+        """
+        for idx, _ in pairs:
+            if not 0 <= idx < NUM_ONOFF:
+                self.message_queue.append(
+                    f"[ERR] On/off index {idx} out of range (0..{NUM_ONOFF - 1})"
+                )
+                return False
+        cmd = ",".join(f"d{idx},{1 if on else 0}" for idx, on in pairs)
+        return self.send(cmd)
+
+    def onoff_all_off(self):
+        """Release every on/off solenoid (leaves the regulators alone)."""
+        with self.display_lock:
+            self.onoff_data = {i: False for i in range(NUM_ONOFF)}
+        return self.send("d,off")
+
+    def query_onoff(self):
+        """Query status of all on/off solenoids"""
+        return self.send("d?")
+
     def emergency_stop(self):
-        """Emergency stop - all valves off"""
+        """Emergency stop - all valves off, regulators and solenoids alike"""
         with self.display_lock:
             self.valve_data.clear()
+            self.onoff_data = {i: False for i in range(NUM_ONOFF)}
         return self.send("s")
 
     def query_status(self):
@@ -287,13 +356,14 @@ class ValveController:
 
 
 class LiveDisplay:
-    """Matplotlib display: 6 valves in one row (V0-V5 on Wire)"""
+    """Matplotlib display: 6 regulators per row, plus an on/off solenoid strip"""
 
     def __init__(self, controller):
         self.controller = controller
         self.fig = None
         self.ani = None
-        self.axes = []          # one axis per row, top to bottom
+        self.axes = []          # one axis per regulator row, top to bottom
+        self.onoff_ax = None    # the on/off solenoid strip along the bottom
         self.status_text = None
 
         self.colors = {
@@ -303,18 +373,23 @@ class LiveDisplay:
             'valve_bar': '#4ecdc4',
             'text': '#eaeaea',
             'text_dim': '#888888',
-            'active': '#00ff88'
+            'active': '#00ff88',
+            'onoff_on': '#00ff88',
+            'onoff_off': '#242438'
         }
 
     def setup(self):
         """Create the matplotlib figure and axes"""
         plt.style.use('dark_background')
 
-        self.fig = plt.figure(figsize=(13, 2 + 2.2 * NUM_ROWS),
+        self.fig = plt.figure(figsize=(13, 3.4 + 2.2 * NUM_ROWS),
                               facecolor=self.colors['bg'])
         self.fig.canvas.manager.set_window_title('6-Valve Controller')
 
-        gs = self.fig.add_gridspec(NUM_ROWS, 1, hspace=0.55,
+        # One row per group of regulators, then a short strip for the on/off
+        # solenoids -- they carry one bit each, so they need far less height.
+        gs = self.fig.add_gridspec(NUM_ROWS + 1, 1, hspace=0.75,
+                                   height_ratios=[3] * NUM_ROWS + [1],
                                    left=0.07, right=0.97, top=0.92, bottom=0.06)
 
         self.fig.suptitle('6-Valve Controller (Compact)', fontsize=18,
@@ -328,6 +403,9 @@ class LiveDisplay:
             ax = self.fig.add_subplot(gs[r, 0])
             self._style_axes(ax, v_lo, v_hi, row_title(v_lo, v_hi))
             self.axes.append(ax)
+
+        self.onoff_ax = self.fig.add_subplot(gs[NUM_ROWS, 0])
+        self._style_onoff_axes(self.onoff_ax)
 
         self.status_text = self.fig.text(
             0.98, 0.97, '● IDLE', fontsize=10,
@@ -350,6 +428,39 @@ class LiveDisplay:
         ax.spines['top'].set_visible(False)
         ax.spines['right'].set_visible(False)
         ax.grid(True, axis='y', alpha=0.2, color=self.colors['text_dim'])
+
+    def _style_onoff_axes(self, ax):
+        ax.set_facecolor(self.colors['panel'])
+        ax.set_title(
+            f'On/Off solenoids  d0-d{NUM_ONOFF - 1}  '
+            f'(Giga pins D{ONOFF_PIN0}-D{ONOFF_PIN0 + NUM_ONOFF - 1})',
+            color=self.colors['text'], fontsize=12,
+            fontfamily='monospace', loc='left')
+        ax.set_xlim(-0.5, NUM_ONOFF - 0.5)
+        ax.set_ylim(0, 1)
+        ax.set_xticks(range(NUM_ONOFF))
+        # Label with both numbers, because the index and the pin differ by two
+        # and mixing them up actuates the wrong valve.
+        ax.set_xticklabels([f'd{i}\nD{ONOFF_PIN0 + i}' for i in range(NUM_ONOFF)])
+        ax.set_yticks([])
+        ax.tick_params(colors=self.colors['text_dim'])
+        for side in ('top', 'right', 'left'):
+            ax.spines[side].set_visible(False)
+        ax.spines['bottom'].set_color(self.colors['accent'])
+
+    def _redraw_onoff(self, states):
+        ax = self.onoff_ax
+        ax.clear()
+        self._style_onoff_axes(ax)
+
+        for i in range(NUM_ONOFF):
+            on = states.get(i, False)
+            ax.bar(i, 1.0, 0.7,
+                   color=self.colors['onoff_on'] if on else self.colors['onoff_off'],
+                   alpha=0.9 if on else 1.0)
+            ax.text(i, 0.5, 'ON' if on else 'OFF', ha='center', va='center',
+                    fontsize=10, fontweight='bold', fontfamily='monospace',
+                    color=self.colors['bg'] if on else self.colors['text_dim'])
 
     @staticmethod
     def _mv_to_bar(mV):
@@ -385,14 +496,18 @@ class LiveDisplay:
         ctrl = self.controller
         with ctrl.display_lock:
             snapshot = dict(ctrl.valve_data)
+            onoff = dict(ctrl.onoff_data)
 
         for r, ax in enumerate(self.axes):
             v_lo = r * ROW_SIZE
             v_hi = min(v_lo + ROW_SIZE - 1, NUM_VALVES - 1)
             self._redraw_row(ax, v_lo, v_hi, row_title(v_lo, v_hi), snapshot)
 
-        if snapshot:
-            self.status_text.set_text(f'● ACTIVE ({len(snapshot)})')
+        self._redraw_onoff(onoff)
+
+        n_on = sum(1 for v in onoff.values() if v)
+        if snapshot or n_on:
+            self.status_text.set_text(f'● ACTIVE ({len(snapshot)} reg, {n_on} on/off)')
             self.status_text.set_color(self.colors['active'])
         else:
             self.status_text.set_text('● IDLE')
@@ -417,14 +532,23 @@ class LiveDisplay:
 def print_help():
     print("""
 +-------------------------------------------------------------------+
-|               6-VALVE CONTROLLER - COMMANDS                      |
+|               6-VALVE CONTROLLER - COMMANDS                       |
 +-------------------------------------------------------------------+
-|  VALVE CONTROL  (indices 0..5; all on Wire):                     |
+|  PROPORTIONAL REGULATORS  (indices 0..5; all on Wire):            |
 |    valve,value         Set single valve (e.g. 0,900 or 3,450)     |
 |    v1,val1,v2,val2,..  Set multiple    (e.g. 0,900,3,450)         |
-|    valve,off           Turn off valve  (e.g. 20,off)              |
-|    s                   EMERGENCY STOP (all valves off)            |
-|    ?                   Query status of all valves                 |
+|    valve,off           Turn off valve  (e.g. 4,off)               |
+|    ?                   Query status of all regulators             |
++-------------------------------------------------------------------+
+|  ON/OFF SOLENOIDS  (indices 0..5 == Giga pins D2..D7):            |
+|    dN,V                Set one    (d0,1  d0,on  d0,0  d0,off)     |
+|    dN,V,dM,V,..        Set several            (e.g. d0,1,d3,0)    |
+|    d,off               Release every on/off valve                 |
+|    d  or  d?           Query status of all on/off valves          |
+|                                                                   |
+|    NOTE: d0 is pin D2, d5 is pin D7. The index is NOT the pin.    |
++-------------------------------------------------------------------+
+|  s                     EMERGENCY STOP (regulators AND solenoids)  |
 +-------------------------------------------------------------------+
 |  INFO:                                                            |
 |    p                   Ping test                                  |
@@ -449,7 +573,10 @@ def input_loop(controller):
 
             prompt = "[VALVE]"
             if controller.valve_data:
-                prompt += f" [{len(controller.valve_data)} active]"
+                prompt += f" [{len(controller.valve_data)} reg]"
+            n_on = sum(1 for v in controller.onoff_data.values() if v)
+            if n_on:
+                prompt += f" [{n_on} on/off]"
             prompt += "> "
 
             cmd = input(prompt).strip()
@@ -486,6 +613,48 @@ def input_loop(controller):
 
             if cmd_lower == 'p':
                 controller.ping()
+                continue
+
+            # ==================== ON/OFF SOLENOIDS ====================
+            # Checked before the regulator parser: 'd0,1' must never reach
+            # int('d0'). Indices are 0..5 and map onto Giga pins D2..D7.
+
+            if cmd_lower in ('d', 'd?'):
+                controller.query_onoff()
+                time.sleep(0.2)
+                continue
+
+            if cmd_lower == 'd,off':
+                controller.onoff_all_off()
+                print("  All on/off valves -> OFF")
+                continue
+
+            if cmd_lower.startswith('d') and ',' in cmd_lower:
+                parts = [t.strip() for t in cmd_lower.split(',')]
+                if len(parts) % 2 != 0:
+                    print("[ERR] Invalid format. Use: dN,V or dN,V,dM,V,...")
+                    continue
+                try:
+                    pairs = []
+                    for i in range(0, len(parts), 2):
+                        tok = parts[i]
+                        if tok.startswith('d'):
+                            tok = tok[1:]
+                        idx = int(tok)
+                        val = parts[i + 1]
+                        if val in ('1', 'on'):
+                            on = True
+                        elif val in ('0', 'off'):
+                            on = False
+                        else:
+                            raise ValueError(f"bad value {val!r}")
+                        pairs.append((idx, on))
+                except (ValueError, IndexError) as e:
+                    print(f"[ERR] {e}. Use: dN,V with V = 0/1/on/off, e.g. d0,1")
+                    continue
+                if controller.set_onoff(pairs):
+                    print("  " + ", ".join(
+                        f"D{i}->{'ON' if on else 'OFF'}" for i, on in pairs))
                 continue
 
             # ==================== VALVE CONTROL ====================
