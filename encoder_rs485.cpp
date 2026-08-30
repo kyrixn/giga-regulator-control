@@ -31,15 +31,6 @@ static const int RESP_MAX = 64;
 static const uint32_t ENC_GAP_US        = 500;   // >= 3.5 char times at 115200
 static const uint32_t ENC_RX_TIMEOUT_MS = 50;    // matches the webapp's 0.06s
 
-// Extra byte-times DE is held past the computed end of transmission. Must stay
-// under the 3.5 char times (~304us at 115200) a Modbus slave waits before it
-// replies, or we are still driving the bus when the answer starts. Two bytes
-// leaves ~130us of margin.
-static const uint32_t ENC_TX_GUARD_BYTES = 2;
-
-// Nothing answered the sweep: retry this often rather than sitting dead.
-static const uint32_t ENC_RESCAN_MS = 5000;
-
 // ---- Per-encoder state ----------------------------------------------------
 struct Enc {
   uint8_t  slave;
@@ -76,14 +67,6 @@ static uint32_t g_gapStartUs = 0;
 static uint32_t g_rxStartMs = 0;
 
 static bool     g_hexDump   = false;
-
-// Bus-level diagnostics. Zero bytes ever received means the Giga is not hearing
-// the bus at all (DE stuck high, A/B swapped, no power, dead transceiver);
-// bytes arriving but no valid frame means it hears but does not understand
-// (wrong baud/parity, wrong protocol, marginal termination).
-static uint32_t g_rxBytes    = 0;
-static uint32_t g_badFrames  = 0;
-static uint32_t g_scanEndMs  = 0;   // when the last fruitless sweep finished
 
 // ============================================================
 // Modbus helpers
@@ -146,20 +129,13 @@ static void startRequest(uint8_t slave) {
   while (Serial1.available()) Serial1.read();   // drop any stale bytes
 
   deWrite(true);
-
-  // Stamp the clock BEFORE the write, not after. Whether Serial1.write() buffers
-  // and returns immediately or blocks until the bytes are out, the deadline
-  // then measures from the same instant transmission began: buffered, we hold
-  // the full byte-time; blocking, the time is already spent and DE drops at
-  // once. Stamping afterwards would add a second transmission's worth of hold
-  // on a blocking core and talk over the encoder's reply.
-  g_txStartUs = micros();
   Serial1.write(req, sizeof(req));
 
-  // 10 bits per byte on the wire (start + 8 data + stop).
-  g_txHoldUs = ((uint32_t)(sizeof(req) + ENC_TX_GUARD_BYTES) * 10UL * 1000000UL)
-               / ENC_BAUD;
-  g_state    = ST_TX;
+  // Hold DE for the time the bytes need on the wire, plus a byte of slack.
+  // 10 bits per byte (start + 8 + stop).
+  g_txStartUs = micros();
+  g_txHoldUs  = ((uint32_t)(sizeof(req) + 1) * 10UL * 1000000UL) / ENC_BAUD;
+  g_state     = ST_TX;
 
   if (g_hexDump) printHexFrame("[enc] TX ->", req, sizeof(req));
 }
@@ -186,16 +162,14 @@ static int slotOf(uint8_t slave) {
 static bool acceptFrame() {
   if (g_hexDump) printHexFrame("[enc] RX <-", g_rx, g_rxLen);
 
-  // Anything that arrived but did not validate is counted: it is the signal
-  // that the bus is alive and the misunderstanding is in baud/parity/protocol.
-  if (g_rxLen < 5)                    { g_badFrames++; return false; }
+  if (g_rxLen < 5) return false;
   uint16_t want = modbusCrc(g_rx, g_rxLen - 2);
   uint16_t got  = (uint16_t)g_rx[g_rxLen - 2] | ((uint16_t)g_rx[g_rxLen - 1] << 8);
-  if (want != got)                    { g_badFrames++; return false; }
-  if (g_rx[0] != g_curSlave)          { g_badFrames++; return false; }
-  if (g_rx[1] & 0x80)                 { g_badFrames++; return false; }  // exception
-  if (g_rx[1] != FN_READ_HOLDING)     { g_badFrames++; return false; }
-  if (g_rx[2] != GJW_STATE_COUNT * 2) { g_badFrames++; return false; }
+  if (want != got)              return false;
+  if (g_rx[0] != g_curSlave)    return false;
+  if (g_rx[1] & 0x80)           return false;   // Modbus exception frame
+  if (g_rx[1] != FN_READ_HOLDING) return false;
+  if (g_rx[2] != GJW_STATE_COUNT * 2) return false;
 
   int idx = slotOf(g_curSlave);
   if (idx < 0) {
@@ -227,13 +201,7 @@ static void finishTransaction(bool ok) {
         Serial.print(g_enc[i].slave);
       }
       Serial.print(") in ids ");
-      Serial.print(g_scanLo); Serial.print("-"); Serial.print(g_scanHi);
-      Serial.print("  [rx bytes ");
-      Serial.print(g_rxBytes);
-      Serial.print(", bad frames ");
-      Serial.print(g_badFrames);
-      Serial.println("]");
-      g_scanEndMs = millis();
+      Serial.print(g_scanLo); Serial.print("-"); Serial.println(g_scanHi);
     }
   } else {
     int idx = slotOf(g_curSlave);
@@ -280,12 +248,7 @@ void tick() {
       } else if (g_count > 0) {
         startRequest(g_enc[g_pollIdx].slave);
       } else {
-        // Nothing answered the sweep. Retry on a timer rather than sitting
-        // dead, so plugging the bus in after boot is enough to bring it up.
-        if ((uint32_t)(millis() - g_scanEndMs) >= ENC_RESCAN_MS) {
-          g_scanning = true;
-          g_scanId   = g_scanLo;
-        }
+        // Nothing answered the sweep. Idle here; 'es' restarts a scan.
         g_gapStartUs = micros();
       }
       return;
@@ -300,7 +263,6 @@ void tick() {
     case ST_RX: {
       while (Serial1.available() && g_rxLen < RESP_MAX) {
         g_rx[g_rxLen++] = (uint8_t)Serial1.read();
-        g_rxBytes++;
         // Byte 2 carries the payload size, so the total length is known as
         // soon as the header lands -- exception frames are 5 bytes total.
         if (g_rxLen == 3) {
@@ -337,9 +299,9 @@ int64_t absolute(int i) {
 }
 
 void rescan(int lo, int hi) {
-  // Modbus reserves 0 (broadcast) and 248..255; clamp rather than reject so a
-  // fat-fingered 'es0,300' still does something sane instead of hanging.
-  if (lo < 1)   lo = 1;
+  // Modbus reserves 248..255; clamp rather than reject so a fat-fingered
+  // 'es0,300' still does something sane instead of hanging.
+  if (lo < 0)   lo = 0;
   if (hi > 247) hi = 247;
   if (hi < lo)  hi = lo;
 
@@ -349,8 +311,6 @@ void rescan(int lo, int hi) {
   g_scanning = true;
   g_scanId   = g_scanLo;
   g_pollIdx  = 0;
-  g_rxBytes   = 0;
-  g_badFrames = 0;
   for (int i = 0; i < ENC_MAX; i++) g_enc[i] = Enc();
   Serial.print("Encoders: rescanning ids ");
   Serial.print(g_scanLo); Serial.print("-"); Serial.println(g_scanHi);
@@ -360,9 +320,6 @@ void rescan() { rescan(g_scanLo, g_scanHi); }
 
 int scanLo() { return g_scanLo; }
 int scanHi() { return g_scanHi; }
-
-uint32_t rxBytes()   { return g_rxBytes; }
-uint32_t badFrames() { return g_badFrames; }
 
 void setHexDump(bool on) {
   g_hexDump = on;
@@ -381,31 +338,10 @@ void printAll() {
     Serial.print("scanning... at id ");
     Serial.println(g_scanId);
   }
-  Serial.print("range ");
-  Serial.print(g_scanLo); Serial.print("-"); Serial.print(g_scanHi);
-  Serial.print("  rx bytes ");
-  Serial.print(g_rxBytes);
-  Serial.print("  bad frames ");
-  Serial.println(g_badFrames);
-
   if (g_count == 0) {
-    Serial.println("no encoders found.");
-    if (g_rxBytes == 0) {
-      // Not one edge got through. The fault is upstream of the protocol.
-      Serial.println("  NOTHING received at all -- the Giga is not hearing the bus:");
-      Serial.print("   - DE+/RE wired to D");
-      Serial.print(ENC_DE_PIN);
-      Serial.println("? Stuck high keeps the transceiver transmitting, deaf.");
-      Serial.println("   - A/B swapped, or no 120R termination at the bus ends?");
-      Serial.println("   - MAX485 powered? RO -> D19 (RX1), DI -> D18 (TX1)?");
-      Serial.println("   - 5V MAX485 drives RO to 5V; the Giga needs 3.3V (MAX3485).");
-    } else {
-      // Bytes are arriving, so the wiring works and the framing does not.
-      Serial.println("  bytes ARE arriving but no frame validated:");
-      Serial.println("   - baud/parity mismatch? this build is 115200 8N1.");
-      Serial.println("   - echo of our own request (DE released late)?");
-      Serial.println("   - run 'ex' then 'es' to see the raw frames.");
-    }
+    Serial.print("no encoders found in ids ");
+    Serial.print(g_scanLo); Serial.print("-"); Serial.println(g_scanHi);
+    Serial.println("check A/B polarity, 120R termination, DE wiring, baud 115200 8N1");
     return;
   }
   Serial.println("slave  on  single_turn      turns    absolute  speed  stat  err  bad");

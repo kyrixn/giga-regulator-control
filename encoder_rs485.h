@@ -46,12 +46,10 @@
 // particular id: whatever answers inside the range is kept, in the order found.
 // enc::rescan(lo, hi) narrows it at runtime ('es50,80') without a reflash.
 //
-// Starts at 1, not 0: Modbus id 0 is the broadcast address and no device ever
-// replies to it, so probing it can only ever time out.
-// A full 1..200 sweep costs ~10s at ENC_RX_TIMEOUT_MS per silent id. That is
+// A full 0..200 sweep costs ~10s at ENC_RX_TIMEOUT_MS per silent id. That is
 // wall-clock only -- tick() stays non-blocking throughout -- but it is why the
 // sweep narrows to the ids that answered once it has found them.
-#define ENC_SCAN_LO    1
+#define ENC_SCAN_LO    0
 #define ENC_SCAN_HI    200
 #define ENC_BAUD       115200
 #define ENC_PARITY     SERIAL_8N1
@@ -77,11 +75,6 @@ namespace enc {
   int16_t  speed(int i);          // raw angular velocity
   uint16_t statusCode(int i);
   uint16_t errorCount(int i);
-
-  // Bus-level counters, for telling "nothing is wired" apart from "wired but
-  // not understood": bytes seen at all vs. frames that failed validation.
-  uint32_t rxBytes();
-  uint32_t badFrames();
 
   void printAll();                // the 'e' command: raw values for every encoder
   void rescan();                  // the 'es' command: sweep the current range
