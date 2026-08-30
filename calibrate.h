@@ -4,9 +4,14 @@
  * Automated command-vs-measured sweep for one regulator, so a calibration
  * curve is a serial command rather than an afternoon with a notebook.
  *
- * Steps the commanded voltage from 0 to a ceiling, waits for the pneumatics to
- * settle at each point, averages the AD7606 reading, and prints a table of
- * commanded kPa, measured kPa and the error between them.
+ * Steps the commanded voltage from 0 to a ceiling and back down, waits for the
+ * pneumatics to settle at each point, averages the AD7606 reading, and prints
+ * commanded kPa against measured kPa with the error and the hysteresis.
+ *
+ * Both directions on purpose. One ascending sweep cannot separate a fixed
+ * offset from hysteresis, and that is exactly what decides whether a
+ * calibration table is worth building: no table can correct an error that
+ * depends on which direction the pressure arrived from.
  *
  * Design contract (mirrors adc, enc and ui): cal::tick() is cooperative and
  * non-blocking. A sweep takes tens of seconds of wall-clock and MUST NOT be a
