@@ -12,16 +12,21 @@
  * D11/12/13 -- see the note in adc_ad7606.cpp. Opening Serial1 here talks to
  * D0/D1 and the bus stays silent with no error anywhere.
  *
- * Protocol (identical to the vc2_webapp project's modbus_rtu.py, which is the
- * reference implementation): read holding registers, function 0x03, address
- * 0x0380, count 16 -- the GJW "group 14" live state block. Decoded fields:
+ * Protocol: read holding registers, function 0x03, address 0x0380.
  *
  *   reg[0..1]   single-turn position   u32   (0..counts_per_turn-1)
  *   reg[2..3]   turns                  s32
- *   reg[4]      status code            u16
- *   reg[5]      angular velocity       s16
- *   reg[8..9]   original single-turn   u32   (pre-offset, unused here)
- *   reg[12]     error count            u16
+ *   reg[4]      status code            u16   } only in the 16-register block
+ *   reg[5]      angular velocity       s16   }
+ *   reg[12]     error count            u16   }
+ *
+ * HOW MANY REGISTERS: ref/sketch_position_speed.ino is a sketch confirmed
+ * working against THIS station's encoder, and it asks for 4 (0x0380..0x0383,
+ * position + turns, a 13-byte reply). vc2_webapp asks for 16 and works against
+ * the encoders on that rig. Asking for more registers than a device maps gets
+ * an illegal-data-address exception rather than a short reply, so the count is
+ * not a "read as much as you can" knob -- it has to match the device. Default
+ * to the 4 this hardware is proven with; ENC_REG_COUNT 16 restores the rest.
  *
  * absolute position = turns * ENC_COUNTS_PER_TURN + single_turn_position, which
  * needs 64 bits: at 2^21 counts/turn it leaves int32 after ~1024 turns.
@@ -62,6 +67,11 @@
 #define ENC_SCAN_HI    200
 #define ENC_BAUD       115200
 #define ENC_PARITY     SERIAL_8N1
+
+// Registers requested at 0x0380. See "HOW MANY REGISTERS" above: 4 is what
+// ref/sketch_position_speed.ino proves against this station's encoder; 16 adds
+// status, speed and error count but only on devices that map them.
+#define ENC_REG_COUNT  4
 
 // The UART behind D18/D19. See the note above before changing this.
 #define ENC_UART       Serial2

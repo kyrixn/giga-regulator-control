@@ -24,7 +24,7 @@
 // GJW group-14 live state block (holding registers).
 static const uint8_t  FN_READ_HOLDING   = 0x03;
 static const uint16_t GJW_STATE_REGISTER = 0x0380;
-static const uint16_t GJW_STATE_COUNT    = 16;
+static const uint16_t GJW_STATE_COUNT    = ENC_REG_COUNT;
 
 // 1 slave + 1 function + 1 byte-count + 32 data + 2 CRC.
 static const int RESP_MAX = 64;
@@ -32,11 +32,14 @@ static const int RESP_MAX = 64;
 static const uint32_t ENC_GAP_US        = 500;   // >= 3.5 char times at 115200
 static const uint32_t ENC_RX_TIMEOUT_MS = 50;    // matches the webapp's 0.06s
 
-// Extra byte-times DE is held past the computed end of transmission. Must stay
-// under the 3.5 char times (~304us at 115200) a Modbus slave waits before it
-// replies, or we are still driving the bus when the answer starts. Two bytes
-// leaves ~130us of margin.
-static const uint32_t ENC_TX_GUARD_BYTES = 2;
+// DE is asserted this long before the first bit, letting the driver enable so
+// the start bit is not clipped. ref/sketch_position_speed.ino uses 15us.
+static const uint32_t ENC_TX_SETTLE_US = 15;
+
+// ...and held this long past the computed end of transmission. Kept small: the
+// reference releases DE only 30us after flush(), and a slave that answers
+// faster than the 3.5-char (304us) turnaround would be talked over.
+static const uint32_t ENC_TX_GUARD_US = 50;
 
 // Nothing answered the sweep: retry this often rather than sitting dead.
 static const uint32_t ENC_RESCAN_MS = 5000;
@@ -158,6 +161,7 @@ static void startRequest(uint8_t slave) {
   while (ENC_UART.available()) ENC_UART.read();   // drop any stale bytes
 
   deWrite(true);
+  delayMicroseconds(ENC_TX_SETTLE_US);   // let the driver enable first
 
   // Stamp the clock BEFORE the write, not after. Whether write() buffers and
   // returns at once or blocks until the bytes are out, the deadline then
@@ -168,9 +172,9 @@ static void startRequest(uint8_t slave) {
   g_txStartUs = micros();
   ENC_UART.write(req, sizeof(req));
 
-  // 10 bits per byte on the wire (start + 8 data + stop).
-  g_txHoldUs = ((uint32_t)(sizeof(req) + ENC_TX_GUARD_BYTES) * 10UL * 1000000UL)
-               / ENC_BAUD;
+  // 10 bits per byte on the wire (start + 8 data + stop), plus the guard.
+  g_txHoldUs = ((uint32_t)sizeof(req) * 10UL * 1000000UL) / ENC_BAUD
+               + ENC_TX_GUARD_US;
   g_state    = ST_TX;
 
   if (g_hexDump) printHexFrame("[enc] TX ->", req, sizeof(req));
@@ -182,9 +186,14 @@ static void storeState(int idx, const uint8_t *regs) {
   #define REG(n) ((uint16_t)((regs[(n) * 2] << 8) | regs[(n) * 2 + 1]))
   g_enc[idx].singleTurn = ((uint32_t)REG(0) << 16) | REG(1);
   g_enc[idx].turns      = (int32_t)(((uint32_t)REG(2) << 16) | REG(3));
-  g_enc[idx].status     = REG(4);
-  g_enc[idx].speed      = (int16_t)REG(5);
-  g_enc[idx].errors     = REG(12);
+  // Status, speed and error count live past register 3, so they only exist
+  // when the larger block is being read. Left at zero otherwise rather than
+  // decoded out of registers we never asked for.
+  #if ENC_REG_COUNT >= 13
+    g_enc[idx].status = REG(4);
+    g_enc[idx].speed  = (int16_t)REG(5);
+    g_enc[idx].errors = REG(12);
+  #endif
   #undef REG
   g_enc[idx].online = true;
 }
