@@ -2,7 +2,15 @@
  * encoder_rs485.h
  *
  * Up to ENC_MAX GJW absolute encoders on one RS-485 bus, read over Modbus RTU
- * through a MAX485 transceiver on Serial1 (TX1 = D18, RX1 = D19).
+ * through a MAX485 transceiver on the header pins silkscreened TX1/RX1,
+ * D18 and D19.
+ *
+ * NOTE the object name: those pins are `Serial2`, NOT `Serial1`. The GIGA
+ * variant maps SERIAL1_TX/RX to D1/D0 and SERIAL2_TX/RX to D18/D19
+ * (variants/GIGA/pins_arduino.h), so the silkscreen's "1" and the Arduino
+ * object's "1" are different numbers. Same trap as the SPI/SPI1 split on
+ * D11/12/13 -- see the note in adc_ad7606.cpp. Opening Serial1 here talks to
+ * D0/D1 and the bus stays silent with no error anywhere.
  *
  * Protocol (identical to the vc2_webapp project's modbus_rtu.py, which is the
  * reference implementation): read holding registers, function 0x03, address
@@ -19,7 +27,8 @@
  * needs 64 bits: at 2^21 counts/turn it leaves int32 after ~1024 turns.
  *
  * WIRING
- *   MAX485 RO  -> Giga D19 (RX1)      MAX485 DI  -> Giga D18 (TX1)
+ *   MAX485 RO  -> Giga D19 (RX1 pin, = Serial2 RX)
+ *   MAX485 DI  -> Giga D18 (TX1 pin, = Serial2 TX)
  *   MAX485 DE + /RE tied together     -> Giga ENC_DE_PIN
  *   A / B to the encoder bus, 120R termination at both physical ends.
  *
@@ -54,8 +63,11 @@
 #define ENC_BAUD       115200
 #define ENC_PARITY     SERIAL_8N1
 
+// The UART behind D18/D19. See the note above before changing this.
+#define ENC_UART       Serial2
+
 // MAX485 DE + /RE, tied together. -1 for an auto-direction module.
-// D10 is free: D2..D7 are the solenoids, D11..D13 SPI1, D18/D19 Serial1.
+// D10 is free: D2..D7 are the solenoids, D11..D13 SPI1, D18/D19 the RS-485 UART.
 #define ENC_DE_PIN     10
 
 // 21-bit single-turn resolution, matching DEFAULT_COUNTS_PER_TURN in

@@ -28,7 +28,7 @@
  * regulators above; addressed with 'd' commands.
  *
  * Length feedback: up to 6 GJW absolute encoders on RS-485, read as Modbus RTU
- * through a MAX485 on Serial1 (TX1 D18 / RX1 D19), DE on D10. Same encoders and
+ * through a MAX485 on pins D18/D19 (the TX1/RX1 silkscreen = Serial2), DE on D10.
  * same register block as the vc2_webapp project; see encoder_rs485.h.
  *
  * Analog feedback: one AD7606 board (board 0), channels 0..5 -> valves 0..5.
@@ -65,7 +65,7 @@
 #include "ui_display.h"   // on-Giga touchscreen UI (non-blocking)
 #include "adc_ad7606.h"   // AD7606 analog acquisition on SPI (non-blocking)
 #include "valves_onoff.h" // six 2-position solenoids on D2..D7 (GPIO only)
-#include "encoder_rs485.h"// GJW encoders on Serial1 via MAX485 (non-blocking)
+#include "encoder_rs485.h"// GJW encoders on D18/D19 via MAX485 (non-blocking)
 
 #define NUM_DACS     3                    // 0x58..0x5A on Wire
 #define NUM_VALVES   (NUM_DACS * 2)       // 6 valves (2 channels per DAC)
@@ -691,10 +691,10 @@ void setup() {
   Serial.print(ADC_SAMPLE_HZ);
   Serial.println("Hz) - type 'a' for readings");
 
-  // RS-485 encoders on Serial1. begin() only opens the port and arms the scan;
+  // RS-485 encoders on D18/D19. begin() only opens the port and arms the scan;
   // the sweep itself runs in tick(), so setup() never waits on the bus.
   enc::begin();
-  Serial.print("Encoders: MAX485 on Serial1 (TX1 D18/RX1 D19), DE D");
+  Serial.print("Encoders: MAX485 on pins D18/D19 (Serial2), DE D");
   Serial.print(ENC_DE_PIN);
   Serial.print(", scanning ids ");
   Serial.print(ENC_SCAN_LO); Serial.print("-"); Serial.print(ENC_SCAN_HI);

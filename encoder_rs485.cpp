@@ -5,7 +5,7 @@
  *
  *   ST_GAP  inter-frame silence. Modbus RTU wants 3.5 character times of quiet
  *           between frames; at 115200 that is ~304us, and ENC_GAP_US clears it.
- *   ST_TX   the request is in Serial1's buffer and DE is HIGH. We hold it there
+ *   ST_TX   the request is in the UART's buffer and DE is HIGH. We hold it there
  *           for as long as the bytes take to clock out, then drop DE. Timed
  *           rather than flush()ed on purpose: flush() blocks for ~700us, and
  *           releasing DE one bit early truncates the CRC and the encoder never
@@ -126,10 +126,10 @@ static void startRequest(uint8_t slave) {
   g_rxLen    = 0;
   g_rxExpect = 0;
 
-  while (Serial1.available()) Serial1.read();   // drop any stale bytes
+  while (ENC_UART.available()) ENC_UART.read();   // drop any stale bytes
 
   deWrite(true);
-  Serial1.write(req, sizeof(req));
+  ENC_UART.write(req, sizeof(req));
 
   // Hold DE for the time the bytes need on the wire, plus a byte of slack.
   // 10 bits per byte (start + 8 + stop).
@@ -219,13 +219,13 @@ namespace enc {
 
 void begin() {
   if (ENC_DE_PIN >= 0) {
-    // Receive by default: DE must be low before Serial1 comes up, or this node
+    // Receive by default: DE must be low before the UART comes up, or this node
     // drives the bus while every other device is trying to talk.
     digitalWrite(ENC_DE_PIN, LOW);
     pinMode(ENC_DE_PIN, OUTPUT);
     digitalWrite(ENC_DE_PIN, LOW);
   }
-  Serial1.begin(ENC_BAUD, ENC_PARITY);
+  ENC_UART.begin(ENC_BAUD, ENC_PARITY);
 
   for (int i = 0; i < ENC_MAX; i++) g_enc[i] = Enc();
   g_count      = 0;
@@ -261,8 +261,8 @@ void tick() {
       return;
 
     case ST_RX: {
-      while (Serial1.available() && g_rxLen < RESP_MAX) {
-        g_rx[g_rxLen++] = (uint8_t)Serial1.read();
+      while (ENC_UART.available() && g_rxLen < RESP_MAX) {
+        g_rx[g_rxLen++] = (uint8_t)ENC_UART.read();
         // Byte 2 carries the payload size, so the total length is known as
         // soon as the header lands -- exception frames are 5 bytes total.
         if (g_rxLen == 3) {
@@ -333,7 +333,7 @@ bool hexDump() { return g_hexDump; }
 // into displacement lives in the PC app (vc2_webapp), and duplicating it on the
 // Giga would give two places to disagree about what a count means.
 void printAll() {
-  Serial.println("=== RS-485 encoders (Serial1, D18/D19) ===");
+  Serial.println("=== RS-485 encoders (Serial2 = pins D18/D19) ===");
   if (g_scanning) {
     Serial.print("scanning... at id ");
     Serial.println(g_scanId);
