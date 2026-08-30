@@ -54,6 +54,7 @@
  *     el                 Dump the bus unframed for 3s (raw hex)
  *     et                 Loopback self-test (jumper D18 to D19 first)
  *     ex                 Toggle hex dump of every Modbus frame
+ *   c<v>[,maxMv]       Sweep regulator v and print commanded vs measured
  *   s                  Emergency stop (regulators AND on/off valves)
  *   p                  Ping test
  *   a                  Dump every AD7606 channel
@@ -69,6 +70,7 @@
 #include "adc_ad7606.h"   // AD7606 analog acquisition on SPI (non-blocking)
 #include "valves_onoff.h" // six 2-position solenoids on D2..D7 (GPIO only)
 #include "encoder_rs485.h"// GJW encoders on D18/D19 via MAX485 (non-blocking)
+#include "calibrate.h"   // command-vs-measured sweep for one regulator
 
 #define NUM_DACS     3                    // 0x58..0x5A on Wire
 #define NUM_VALVES   (NUM_DACS * 2)       // 6 valves (2 channels per DAC)
@@ -240,6 +242,7 @@ void valveOff(int valve) {
  * makes an emergency stop actually stop everything.
  */
 void allValvesOff() {
+  cal::abort();               // a sweep in progress must not re-drive the valve
   for (int i = 0; i < NUM_VALVES; i++) {
     valveOff(i);
   }
@@ -440,6 +443,19 @@ void processSerialCommand() {
 
         if (cmdLower == "i") {
           scanI2C();                // which addresses actually answer
+          inputBuffer = "";
+          return;
+        }
+
+        // 'c<valve>' or 'c<valve>,<maxMv>' sweeps one regulator and prints
+        // commanded vs measured. Checked before the 'e' family and before
+        // parseCommand so a bare number is still a setpoint.
+        if (cmdLower.length() > 1 && cmdLower[0] == 'c') {
+          String rest = cmdLower.substring(1);
+          int comma = rest.indexOf(',');
+          int valve = (comma < 0 ? rest : rest.substring(0, comma)).toInt();
+          int maxMv = comma < 0 ? 0 : rest.substring(comma + 1).toInt();
+          cal::start(valve, maxMv);
           inputBuffer = "";
           return;
         }
@@ -714,6 +730,7 @@ void setup() {
   Serial.println("Commands: valve,value | dN,0|1 | s=stop | ?=status | d?=on/off status");
   Serial.println("          e=encoders | es=rescan | el=listen | et=loopback");
   Serial.println("          ep<n>=DE pin | ex=hex dump");
+  Serial.println("          c<v>[,maxMv]=calibration sweep, e.g. c0 or c0,3000");
   Serial.println("          p=ping | a=ADC dump | i=I2C scan");
 
   // Bring up the touchscreen UI last, so valve state already reflects a clean
@@ -745,5 +762,6 @@ void loop() {
   processSerialCommand();   // serial ALWAYS has priority, every iteration
   adc::tick();              // cooperative, non-blocking AD7606 sampling
   enc::tick();              // cooperative, non-blocking RS-485 Modbus polling
+  cal::tick();              // cooperative, non-blocking calibration sweep
   ui::tick();               // cooperative, non-blocking display + touch
 }
