@@ -54,7 +54,8 @@
  *     el                 Dump the bus unframed for 3s (raw hex)
  *     et                 Loopback self-test (jumper D18 to D19 first)
  *     ex                 Toggle hex dump of every Modbus frame
- *   c<v>[,maxMv]       Sweep regulator v and print commanded vs measured
+ *   c<v>[,maxMv[,n]]   Sweep regulator v and print commanded vs measured
+ *   k                  Show the per-regulator calibration tables
  *   s                  Emergency stop (regulators AND on/off valves)
  *   p                  Ping test
  *   a                  Dump every AD7606 channel
@@ -71,6 +72,7 @@
 #include "valves_onoff.h" // six 2-position solenoids on D2..D7 (GPIO only)
 #include "encoder_rs485.h"// GJW encoders on D18/D19 via MAX485 (non-blocking)
 #include "calibrate.h"   // command-vs-measured sweep for one regulator
+#include "calib_table.h"// per-regulator open-loop command correction
 
 #define NUM_DACS     3                    // 0x58..0x5A on Wire
 #define NUM_VALVES   (NUM_DACS * 2)       // 6 valves (2 channels per DAC)
@@ -215,7 +217,10 @@ bool setValve(int valve, int value) {
     mV = value;
   #endif
 
-  dacs[valve]->setDACOutVoltage(mV, dacChannels[valve]);
+  // Correct on the way out only. currentValue keeps what was ASKED for, so the
+  // display, '?' and the PC app all report intent rather than the compensated
+  // voltage -- otherwise a calibrated valve would appear to ignore commands.
+  dacs[valve]->setDACOutVoltage(calibApply(valve, mV), dacChannels[valve]);
   currentValue[valve] = value;
 
   return true;
@@ -462,6 +467,12 @@ void processSerialCommand() {
             if (c2 >= 0) cycles = tail.substring(c2 + 1).toInt();
           }
           cal::start(valve, maxMv, cycles);
+          inputBuffer = "";
+          return;
+        }
+
+        if (cmdLower == "k") {
+          calibPrint();
           inputBuffer = "";
           return;
         }
@@ -737,6 +748,7 @@ void setup() {
   Serial.println("          e=encoders | es=rescan | el=listen | et=loopback");
   Serial.println("          ep<n>=DE pin | ex=hex dump");
   Serial.println("          c<v>[,maxMv[,cycles]]=cal sweep, e.g. c0,2200,3");
+  Serial.println("          k=show calibration tables");
   Serial.println("          p=ping | a=ADC dump | i=I2C scan");
 
   // Bring up the touchscreen UI last, so valve state already reflects a clean
