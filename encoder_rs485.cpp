@@ -36,10 +36,19 @@ static const uint32_t ENC_RX_TIMEOUT_MS = 50;    // matches the webapp's 0.06s
 // the start bit is not clipped. ref/sketch_position_speed.ino uses 15us.
 static const uint32_t ENC_TX_SETTLE_US = 15;
 
-// ...and held this long past the computed end of transmission. Kept small: the
-// reference releases DE only 30us after flush(), and a slave that answers
-// faster than the 3.5-char (304us) turnaround would be talked over.
-static const uint32_t ENC_TX_GUARD_US = 50;
+// ...and held this long past the computed end of transmission.
+//
+// The reference sketch's 30us is measured from AFTER flush(), and that is what
+// broke this on the GIGA: AVR's flush() waits for the shift register to empty,
+// mbed's does not, so DE dropped mid-byte and truncated the CRC. Raising it to
+// 200us on the Mega-derived code is what finally made the encoder answer.
+//
+// This code never calls flush(); it times from before the write, so the hold
+// already covers the whole transmission. The guard is only slack for however
+// long the UART takes to actually start shifting. It must stay under the 3.5
+// character times (~304us at 115200) a slave waits before replying, or we are
+// still driving the bus when the answer starts.
+static const uint32_t ENC_TX_GUARD_US = 150;
 
 // Nothing answered the sweep: retry this often rather than sitting dead.
 static const uint32_t ENC_RESCAN_MS = 5000;
