@@ -27,6 +27,10 @@
  * opto-isolated MOSFET board (see valves_onoff.h). Independent of the
  * regulators above; addressed with 'd' commands.
  *
+ * Length feedback: up to 6 GJW absolute encoders on RS-485, read as Modbus RTU
+ * through a MAX485 on Serial1 (TX1 D18 / RX1 D19), DE on D10. Same encoders and
+ * same register block as the vc2_webapp project; see encoder_rs485.h.
+ *
  * Analog feedback: one AD7606 board (board 0), channels 0..5 -> valves 0..5.
  * The 1-5V monitor sits inside the ADC's +/-10V range as wired; see
  * ADC_RANGE_V in adc_ad7606.h if the module's RANGE pin is moved to +/-5V.
@@ -42,6 +46,11 @@
  *     dN,V,dM,V,..       Set several:   d0,1,d3,0
  *     d,off              Release all on/off valves
  *     d  or  d?          Status of all 6 on/off valves
+ *   RS-485 encoders:
+ *     e                  Raw values for every encoder found
+ *     es                 Re-sweep the slave-id range
+ *     es<lo>,<hi>        Re-sweep a different id range, e.g. es50,80
+ *     ex                 Toggle hex dump of every Modbus frame
  *   s                  Emergency stop (regulators AND on/off valves)
  *   p                  Ping test
  *   a                  Dump every AD7606 channel
@@ -56,6 +65,7 @@
 #include "ui_display.h"   // on-Giga touchscreen UI (non-blocking)
 #include "adc_ad7606.h"   // AD7606 analog acquisition on SPI (non-blocking)
 #include "valves_onoff.h" // six 2-position solenoids on D2..D7 (GPIO only)
+#include "encoder_rs485.h"// GJW encoders on Serial1 via MAX485 (non-blocking)
 
 #define NUM_DACS     3                    // 0x58..0x5A on Wire
 #define NUM_VALVES   (NUM_DACS * 2)       // 6 valves (2 channels per DAC)
@@ -414,6 +424,35 @@ void processSerialCommand() {
           return;
         }
 
+        if (cmdLower == "e") {
+          enc::printAll();
+          inputBuffer = "";
+          return;
+        }
+
+        if (cmdLower == "es") {
+          enc::rescan();
+          inputBuffer = "";
+          return;
+        }
+
+        // 'es<lo>,<hi>' sweeps a different id range, e.g. es50,80 -- the
+        // encoders' ids are wiring, not firmware, so this stays runtime.
+        if (cmdLower.startsWith("es") && cmdLower.indexOf(',') > 2) {
+          int comma = cmdLower.indexOf(',');
+          int lo = cmdLower.substring(2, comma).toInt();
+          int hi = cmdLower.substring(comma + 1).toInt();
+          enc::rescan(lo, hi);
+          inputBuffer = "";
+          return;
+        }
+
+        if (cmdLower == "ex") {
+          enc::setHexDump(!enc::hexDump());
+          inputBuffer = "";
+          return;
+        }
+
         if (cmdLower == "d" || cmdLower == "d?") {
           dv::printStatus();
           inputBuffer = "";
@@ -634,6 +673,7 @@ void setup() {
   Serial.print(DV_ACTIVE_LOW ? "LOW" : "HIGH");
   Serial.println(")");
   Serial.println("Commands: valve,value | dN,0|1 | s=stop | ?=status | d?=on/off status");
+  Serial.println("          e=encoders | es=rescan | ex=hex dump");
   Serial.println("          p=ping | a=ADC dump | i=I2C scan");
 
   // Bring up the touchscreen UI last, so valve state already reflects a clean
@@ -650,10 +690,20 @@ void setup() {
   Serial.print(" ch @ ");
   Serial.print(ADC_SAMPLE_HZ);
   Serial.println("Hz) - type 'a' for readings");
+
+  // RS-485 encoders on Serial1. begin() only opens the port and arms the scan;
+  // the sweep itself runs in tick(), so setup() never waits on the bus.
+  enc::begin();
+  Serial.print("Encoders: MAX485 on Serial1 (TX1 D18/RX1 D19), DE D");
+  Serial.print(ENC_DE_PIN);
+  Serial.print(", scanning ids ");
+  Serial.print(ENC_SCAN_LO); Serial.print("-"); Serial.print(ENC_SCAN_HI);
+  Serial.println(" - type 'e' for readings");
 }
 
 void loop() {
   processSerialCommand();   // serial ALWAYS has priority, every iteration
   adc::tick();              // cooperative, non-blocking AD7606 sampling
+  enc::tick();              // cooperative, non-blocking RS-485 Modbus polling
   ui::tick();               // cooperative, non-blocking display + touch
 }
