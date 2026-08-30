@@ -14,14 +14,61 @@
 // -- a wrong table is worse than none, because it looks like it is working.
 // ===========================================================================
 
+// V0 -- the healthy reference. Sweep c0,2200,3 on 2025 hardware, 2 bar supply.
+// Hysteresis 1..8 kPa, repeatability <=5 kPa. Values are the midpoint of the
+// min/max the three ascending passes reported.
+//
+// The last row is SUPPLY LIMITED: at 2 bar this valve stops climbing around
+// 176 kPa, so commanding 2200mV buys almost nothing over 2000mV. Re-sweep this
+// valve if the supply is raised -- the top of the curve will move, the rest
+// will not.
 static const CalibPoint TABLE_V0[] = {
-  // { 4.0f,   0 },      <- example rows, from the sweep's ascending pass
-  // { 9.0f, 500 },
-  // {62.0f,1100 },
+  {   2.5f,    0 },
+  {   7.5f,  200 },
+  {  25.0f,  400 },
+  {  44.0f,  600 },
+  {  62.0f,  800 },
+  {  79.0f, 1000 },
+  { 104.0f, 1200 },
+  { 122.0f, 1400 },
+  { 139.5f, 1600 },
+  { 157.0f, 1800 },
+  { 172.5f, 2000 },
+  { 176.5f, 2200 },   // supply limited, slope has collapsed to 0.2
 };
 
 static const CalibPoint TABLE_V1[] = {};
-static const CalibPoint TABLE_V2[] = {};
+
+// V2 -- the sticky one. Sweep c2,2200,3, same session and supply as V0.
+//
+// Repeatability is excellent (<=2 kPa), so this table is accurate. What it
+// CANNOT fix is 28 kPa of average hysteresis, seven times V0's. Every row here
+// comes from the ASCENDING pass, so the table is only right when the pressure
+// arrives from below. Approach a setpoint from above and the real pressure sits
+// up to ~35 kPa high, table or no table.
+//
+// Note the 94.5 -> 132.5 step between 1400 and 1600 mV: local slope 2.1 where
+// every other segment is 0.9-1.1. That is the spool breaking free of stiction,
+// and interpolating across it is a guess -- setpoints between about 95 and
+// 130 kPa on this valve should not be trusted until it is cleaned.
+//
+// The first row is the residual: at 0 mV this valve still holds 9.5 kPa,
+// against V0's 2.5. It does not vent completely. Another symptom of the same
+// fault, and the reason nothing below 9.5 kPa is reachable here.
+static const CalibPoint TABLE_V2[] = {
+  {   9.5f,    0 },   // residual -- does not vent below this
+  {  10.0f,  400 },   // dead band edge; 0..400mV all sit at ~10 kPa
+  {  23.0f,  600 },
+  {  42.5f,  800 },
+  {  61.0f, 1000 },
+  {  78.0f, 1200 },
+  {  94.5f, 1400 },
+  { 132.5f, 1600 },   // stiction step: +38 kPa for +200 mV
+  { 149.5f, 1800 },
+  { 165.5f, 2000 },
+  { 181.0f, 2200 },
+};
+
 static const CalibPoint TABLE_V3[] = {};
 static const CalibPoint TABLE_V4[] = {};
 static const CalibPoint TABLE_V5[] = {};

@@ -73,6 +73,7 @@
 #include "encoder_rs485.h"// GJW encoders on D18/D19 via MAX485 (non-blocking)
 #include "calibrate.h"   // command-vs-measured sweep for one regulator
 #include "calib_table.h"// per-regulator open-loop command correction
+#include "approach.h"   // always arrive at a setpoint from below
 
 #define NUM_DACS     3                    // 0x58..0x5A on Wire
 #define NUM_VALVES   (NUM_DACS * 2)       // 6 valves (2 channels per DAC)
@@ -136,6 +137,13 @@ String inputBuffer = "";
  * Build the valve -> (DAC, channel) mapping.
  *   valves 0..5 -> dacBus0[0..2], channels 0/1
  */
+// The one place a DAC is written. Calibration is applied here, on the way out,
+// so every path -- serial, touchscreen, calibration sweep -- gets it.
+void dacWrite(int valve, int mV) {
+  if (valve < 0 || valve >= NUM_VALVES || dacs[valve] == NULL) return;
+  dacs[valve]->setDACOutVoltage(calibApply(valve, mV), dacChannels[valve]);
+}
+
 void buildMapping() {
   for (int d = 0; d < NUM_DACS; d++) {
     int v = d * 2;
@@ -217,11 +225,12 @@ bool setValve(int valve, int value) {
     mV = value;
   #endif
 
-  // Correct on the way out only. currentValue keeps what was ASKED for, so the
-  // display, '?' and the PC app all report intent rather than the compensated
-  // voltage -- otherwise a calibrated valve would appear to ignore commands.
-  dacs[valve]->setDACOutVoltage(calibApply(valve, mV), dacChannels[valve]);
+  // Record intent, then hand the setpoint to apr:: -- it decides whether to
+  // write now or dip below first. currentValue keeps what was ASKED for, so the
+  // display, '?' and the PC app report intent rather than the compensated or
+  // momentarily undershot voltage.
   currentValue[valve] = value;
+  apr::request(valve, mV);
 
   return true;
 }
@@ -231,7 +240,9 @@ bool setValve(int valve, int value) {
  */
 void valveOff(int valve) {
   if (valve < 0 || valve >= NUM_VALVES) return;
-  dacs[valve]->setDACOutVoltage(0, dacChannels[valve]);
+  // force(), not request(): releasing a valve is a stop, and a stop must not
+  // wait on an undershoot timer.
+  apr::force(valve, 0);
   #if INPUT_PRESSURE_MODE
     currentValue[valve] = PRESSURE_MIN;
   #else
@@ -723,6 +734,7 @@ void setup() {
   Wire.begin();   // valves 0..5 on the default bus (D20/D21)
 
   buildMapping();
+  apr::begin(dacWrite);   // must precede initValves(): it writes through apr::
 
   if (initValves()) {
     Serial.println("All DACs initialized successfully!");
@@ -781,5 +793,6 @@ void loop() {
   adc::tick();              // cooperative, non-blocking AD7606 sampling
   enc::tick();              // cooperative, non-blocking RS-485 Modbus polling
   cal::tick();              // cooperative, non-blocking calibration sweep
+  apr::tick();              // cooperative; completes deferred downward moves
   ui::tick();               // cooperative, non-blocking display + touch
 }

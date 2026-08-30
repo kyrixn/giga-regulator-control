@@ -3,6 +3,7 @@
  */
 #include "calibrate.h"
 #include "valve_core.h"
+#include "approach.h"
 
 static bool     g_run     = false;
 static int      g_valve   = 0;
@@ -96,6 +97,9 @@ void start(int valve, int maxMv, int cycles) {
   Serial.println("s. 's' or E-STOP aborts.");
   Serial.println("  dir     mV  cmd_kPa  meas_kPa    err   hyst");
 
+  // The sweep must see the valve's own behaviour. Leaving the undershoot trick
+  // on would hide exactly the hysteresis this is here to measure.
+  apr::setEnabled(false);
   vcSetValveMv(g_valve, mvAt(0));
   g_pointMs = millis();
 }
@@ -104,6 +108,7 @@ void abort() {
   if (!g_run) return;
   g_run = false;
   vcSetValveMv(g_valve, 0);
+  apr::setEnabled(APPROACH_ENABLED != 0);
   Serial.println("=== Calibration aborted ===");
 }
 
@@ -156,6 +161,7 @@ void tick() {
       if (g_cycle >= g_cycles) {
         g_run = false;
         vcSetValveMv(g_valve, 0);
+        apr::setEnabled(APPROACH_ENABLED != 0);
         if (g_cycles > 1) printSummary();
         Serial.println("=== Sweep done, valve released ===");
         return;
