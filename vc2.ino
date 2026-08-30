@@ -454,8 +454,14 @@ void processSerialCommand() {
           String rest = cmdLower.substring(1);
           int comma = rest.indexOf(',');
           int valve = (comma < 0 ? rest : rest.substring(0, comma)).toInt();
-          int maxMv = comma < 0 ? 0 : rest.substring(comma + 1).toInt();
-          cal::start(valve, maxMv);
+          int maxMv = 0, cycles = 1;
+          if (comma >= 0) {
+            String tail = rest.substring(comma + 1);
+            int c2 = tail.indexOf(',');
+            maxMv  = (c2 < 0 ? tail : tail.substring(0, c2)).toInt();
+            if (c2 >= 0) cycles = tail.substring(c2 + 1).toInt();
+          }
+          cal::start(valve, maxMv, cycles);
           inputBuffer = "";
           return;
         }
@@ -730,7 +736,7 @@ void setup() {
   Serial.println("Commands: valve,value | dN,0|1 | s=stop | ?=status | d?=on/off status");
   Serial.println("          e=encoders | es=rescan | el=listen | et=loopback");
   Serial.println("          ep<n>=DE pin | ex=hex dump");
-  Serial.println("          c<v>[,maxMv]=calibration sweep, e.g. c0 or c0,3000");
+  Serial.println("          c<v>[,maxMv[,cycles]]=cal sweep, e.g. c0,2200,3");
   Serial.println("          p=ping | a=ADC dump | i=I2C scan");
 
   // Bring up the touchscreen UI last, so valve state already reflects a clean

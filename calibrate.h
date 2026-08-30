@@ -36,7 +36,10 @@
 #define CAL_DEFAULT_MAX_MV 2200
 
 namespace cal {
-  void start(int valve, int maxMv);  // begin a sweep; clamps to the DAC range
+  // cycles > 1 repeats the whole up-down pass and reports the spread of each
+  // point across passes -- the repeatability, which bounds what any
+  // calibration table can achieve.
+  void start(int valve, int maxMv, int cycles);
   void abort();                      // stop and release the valve
   bool running();
   void tick();                       // non-blocking; call every loop()
