@@ -77,6 +77,8 @@ static_assert(NUM_VALVES == VC_NUM_VALVES,
               "valve_core.h VC_NUM_VALVES must match NUM_VALVES");
 static_assert(DV_NUM_VALVES == VC_NUM_ONOFF,
               "valve_core.h VC_NUM_ONOFF must match DV_NUM_VALVES");
+static_assert(ENC_MAX == VC_NUM_SENSORS,
+              "valve_core.h VC_NUM_SENSORS must match ENC_MAX");
 
 // First contiguous I2C address of the DACs on the bus (0x58..0x5A).
 #define DAC_ADDR_BASE 0x58
@@ -340,6 +342,17 @@ int vcOnOffPin(int idx) {
 void vcOnOffSet(int idx, bool on) {
   dv::set(idx, on);                       // dv::set ignores a bad index
 }
+
+// RS-485 length sensors, page 4 of the display. Pass-throughs to enc:: for the
+// same reason as the solenoids: ui_display.cpp needs no hardware header.
+int  vcSensorCount(void)     { return enc::count(); }
+int  vcSensorId(int i)       { return enc::slaveId(i); }
+bool vcSensorOnline(int i)   { return enc::online(i); }
+bool vcSensorZeroed(int i)   { return enc::zeroed(i); }
+long vcSensorUm(int i)       { return (long)enc::lengthUm(i); }
+bool vcSensorScanning(void)  { return enc::scanning(); }
+void vcSensorScan(void)      { enc::rescan(); }
+void vcSensorZero(void)      { enc::zeroAll(); }
 
 void vcEmergencyStop(void) {
   allValvesOff();

@@ -71,10 +71,29 @@ static const int VC_NUM_ONOFF = 6;
 bool vcOnOffGet(int idx);
 int  vcOnOffPin(int idx);
 
+// --- RS-485 length sensors -------------------------------------------------
+// GJW draw-wire encoders on the Modbus bus (encoder_rs485.h), shown on the
+// display's fourth page. Same boundary as everything else here: ui_display.cpp
+// includes no hardware header.
+//
+// Lengths are micrometres relative to the last zero, integer on purpose -- the
+// page shows 3 decimal places of mm, which is exactly 1um, so this stays exact
+// and avoids float formatting on the display path.
+static const int VC_NUM_SENSORS = 20;   // cells on the sensor page
+
+int   vcSensorCount(void);        // how many answered the last scan
+int   vcSensorId(int i);          // Modbus slave id of sensor i
+bool  vcSensorOnline(int i);
+bool  vcSensorZeroed(int i);
+long  vcSensorUm(int i);          // displacement from zero, micrometres
+bool  vcSensorScanning(void);     // a sweep is in progress
+
 // --- Write / control (implemented in vc2.ino) ------------------------------
 // Serial is never gated: a PC command always lands, and the touchscreen slider
 // follows it because the slider renders vcValueMv() rather than a position of
 // its own. The UI's LOCK gates the touchscreen only.
 void  vcSetValveMv(int valve, int mV);  // drive a valve (touchscreen sliders)
 void  vcOnOffSet(int idx, bool on);     // drive a solenoid (touchscreen toggles)
+void  vcSensorScan(void);               // re-sweep the RS-485 bus (SCAN button)
+void  vcSensorZero(void);               // zero every online sensor (ZERO button)
 void  vcEmergencyStop(void);            // ALL valves off (both kinds) + notice

@@ -54,7 +54,7 @@
 #pragma once
 #include <Arduino.h>
 
-#define ENC_MAX        6        // encoders tracked (the compact rig's muscles)
+#define ENC_MAX        20       // encoders tracked (the display shows this many)
 
 // Default slave-id range swept looking for encoders. Nothing is hardcoded to a
 // particular id: whatever answers inside the range is kept, in the order found.
@@ -84,6 +84,14 @@
 // vc2_webapp/encoder_controller.py.
 #define ENC_COUNTS_PER_TURN 2097152L
 
+// Draw-wire drum diameter (mm). One turn pays out one circumference, so the
+// thread displacement is the arc length:
+//     mm = (absolute - zero) / ENC_COUNTS_PER_TURN * PI * ENC_DRUM_DIA_MM
+// This is DEFAULT_DRUM_DIAMETER_MM from vc2_webapp/encoder_controller.py.
+// NOTE ref/sketch_position_speed.ino uses 13.7 for the same drum -- the two
+// projects disagree by 2%. Trim here if the webapp's figure is the stale one.
+#define ENC_DRUM_DIA_MM 14.0
+
 namespace enc {
   void begin();
   void tick();                    // non-blocking; drives one transaction at a time
@@ -94,6 +102,14 @@ namespace enc {
   uint32_t singleTurn(int i);     // raw single-turn counts
   int32_t  turns(int i);          // raw multi-turn count
   int64_t  absolute(int i);       // turns * ENC_COUNTS_PER_TURN + singleTurn
+
+  // Displacement in micrometres, relative to the last zero. Integer on purpose:
+  // the display wants 3 decimal places of mm, which is exactly 1um, so this
+  // keeps the value exact and away from printf's %f.
+  int32_t  lengthUm(int i);
+  void     zeroAll();             // capture every online encoder's position
+  bool     zeroed(int i);
+  bool     scanning();            // a sweep is in progress
   int16_t  speed(int i);          // raw angular velocity
   uint16_t statusCode(int i);
   uint16_t errorCount(int i);

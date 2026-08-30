@@ -11,6 +11,7 @@
  *                left  -- valve id, setpoint, live measured pressure, span bar
  *                right -- the slider that commands it
  *   page 2     the six on/off solenoids as a 3x2 grid of toggle buttons
+ *   page 3     up to 20 RS-485 length sensors, 4x5, with SCAN and ZERO
  *
  * LOCK gates TOUCH ONLY, on every page. Locked (the power-on state) the sliders
  * and the toggles both ignore the finger, so a brush against the panel cannot
@@ -59,10 +60,11 @@ static const int LOCK_X   = ESTOP_X - LOCK_W - PAD;   // 526
 static const int TABS_X   = PAD;                      // 6
 static const int TABS_W   = LOCK_X - PAD - TABS_X;    // 514
 
-// Two regulator pages, then one page of on/off solenoids.
+// Two regulator pages, then the on/off solenoids, then the length sensors.
 static const int NUM_REG_PAGES = VC_NUM_VALVES / VC_GROUP_SIZE;   // 2
 static const int SOL_PAGE      = NUM_REG_PAGES;                   // 2
-static const int NUM_PAGES     = NUM_REG_PAGES + 1;               // 3
+static const int SENS_PAGE     = NUM_REG_PAGES + 1;               // 3
+static const int NUM_PAGES     = NUM_REG_PAGES + 2;               // 4
 
 // The solenoid page reuses the regulator rows' geometry exactly: VC_GROUP_SIZE
 // rows of two half-width buttons.
@@ -78,6 +80,27 @@ static const int ROW_H    = (BODY_H - (VC_GROUP_SIZE - 1) * PAD)
 static const int HALF_W   = (ROW_W - PAD) / 2;                         // 391
 static const int LEFT_X   = PAD;                                       // 6
 static const int RIGHT_X  = PAD + HALF_W + PAD;                        // 403
+
+// Sensor page: a row of two buttons, then a 4x5 grid of readouts.
+static const int SENS_BTN_H = 40;
+static const int SENS_BTN_W = 150;
+static const int SCAN_X     = PAD;                              // 6
+static const int ZERO_X     = PAD + SENS_BTN_W + PAD;           // 162
+static const int SENS_COLS  = 4;
+static const int SENS_ROWS  = 5;
+static const int SENS_TOP   = TOPBAR_H + PAD + SENS_BTN_H + PAD;             // 132
+static const int SENS_CELL_W = (SCR_W - 2 * PAD - (SENS_COLS - 1) * PAD)
+                               / SENS_COLS;                                   // 192
+static const int SENS_CELL_H = (SCR_H - PAD - SENS_TOP - (SENS_ROWS - 1) * PAD)
+                               / SENS_ROWS;                                   // 63
+
+static_assert(SENS_COLS * SENS_ROWS == VC_NUM_SENSORS,
+              "the sensor page lays VC_NUM_SENSORS out as SENS_COLS x SENS_ROWS");
+
+// Sensor readings only repaint this often. The bus delivers a full sweep at
+// roughly 10 Hz with 20 encoders on it, and 20 cells of text at the UI's 15 Hz
+// would spend most of the frame budget redrawing digits that had not changed.
+static const uint32_t SENS_REDRAW_MS = 250;
 
 // ============================================================
 // Colors (RGB565)
@@ -138,6 +161,10 @@ static bool     cacheValid = false;
 static int      cacheMv[VC_GROUP_SIZE];       // commanded setpoint (mV)
 static float    cacheMeasKpa[VC_GROUP_SIZE];  // measured pressure (kPa)
 static bool     cacheSol[VC_NUM_ONOFF];       // solenoid states (page SOL_PAGE)
+static long     cacheUm[VC_NUM_SENSORS];      // sensor lengths (page SENS_PAGE)
+static int      cacheSensId[VC_NUM_SENSORS];
+static bool     cacheSensOn[VC_NUM_SENSORS];
+static uint32_t lastSensMs = 0;
 
 static int      grabbed = -1;              // slider being dragged, -1 if none
 static bool     wasTouched = false;
@@ -197,6 +224,14 @@ static void solRect(int i, int &x, int &y, int &w, int &h) {
   h = ROW_H;
 }
 
+// Cell i on the sensor page, filled left-to-right then down.
+static void sensRect(int i, int &x, int &y, int &w, int &h) {
+  x = PAD + (i % SENS_COLS) * (SENS_CELL_W + PAD);
+  y = SENS_TOP + (i / SENS_COLS) * (SENS_CELL_H + PAD);
+  w = SENS_CELL_W;
+  h = SENS_CELL_H;
+}
+
 // The slider's active track inside the right half of row k.
 static void sliderTrack(int k, int &tx, int &ty, int &tw, int &th) {
   int y = rowY(k);
@@ -216,15 +251,18 @@ static void drawTab(int i) {
   gfx.fillRect(x, y, w, h, active ? C_TABACT : C_ACCENT);
   gfx.drawRect(x, y, w, h, C_ACCENT_H);
 
+  // Four tabs leave 124px each, so the labels are centred rather than inset --
+  // "ON/OFF" and "SENSOR" are 108px wide and would sit off-centre otherwise.
+  char label[8];
+  if      (i == SOL_PAGE)  snprintf(label, sizeof(label), "ON/OFF");
+  else if (i == SENS_PAGE) snprintf(label, sizeof(label), "SENSOR");
+  else snprintf(label, sizeof(label), "V%d-%d",
+                i * VC_GROUP_SIZE, i * VC_GROUP_SIZE + VC_GROUP_SIZE - 1);
+
   gfx.setTextColor(active ? C_WHITE : C_TEXTDIM);
   gfx.setTextSize(3);
-  gfx.setCursor(x + 12, y + 22);
-  if (i == SOL_PAGE) {
-    gfx.print("ON/OFF");
-  } else {
-    int lo = i * VC_GROUP_SIZE, hi = lo + VC_GROUP_SIZE - 1;
-    gfx.print("V"); gfx.print(lo); gfx.print("-"); gfx.print(hi);
-  }
+  gfx.setCursor(x + (w - textW(label, 3)) / 2, y + 22);
+  gfx.print(label);
 }
 
 // LOCK gates the sliders' response to touch. Amber = live.
@@ -416,6 +454,88 @@ static void drawSolButton(int i) {
 }
 
 // ============================================================
+// Drawing - the RS-485 sensor page
+// ============================================================
+// Micrometres -> "-123.456". Integer formatting on purpose: 3 decimals of mm is
+// exactly 1um, so this is exact and never touches printf's %f.
+static void fmtMm(long um, char *buf, size_t n) {
+  long a = um < 0 ? -um : um;
+  snprintf(buf, n, "%s%ld.%03ld", um < 0 ? "-" : "", a / 1000, a % 1000);
+}
+
+// Just the number, so a changing reading does not repaint the whole cell.
+static void drawSensValue(int i) {
+  int x, y, w, h;
+  sensRect(i, x, y, w, h);
+  gfx.fillRect(x + 2, y + 26, w - 4, 28, C_PANEL);
+
+  if (i >= vcSensorCount()) return;               // empty slot
+
+  char buf[16];
+  bool on = vcSensorOnline(i);
+  if (!on)                    snprintf(buf, sizeof(buf), "---");
+  else if (!vcSensorZeroed(i)) snprintf(buf, sizeof(buf), "---");
+  else                        fmtMm(vcSensorUm(i), buf, sizeof(buf));
+
+  // Drop a size on the rare long reading rather than run off the cell.
+  int size = textW(buf, 3) <= w - 16 ? 3 : 2;
+  gfx.setTextSize(size);
+  gfx.setTextColor(on ? C_TEXT : C_TEXTDIM);
+  gfx.setCursor(x + w - 8 - textW(buf, size), y + 28);
+  gfx.print(buf);
+}
+
+static void drawSensCell(int i) {
+  int x, y, w, h;
+  sensRect(i, x, y, w, h);
+  bool present = (i < vcSensorCount());
+
+  gfx.fillRect(x, y, w, h, C_PANEL);
+  gfx.drawRect(x, y, w, h, present ? C_ACCENT_H : C_ACCENT);
+
+  gfx.setTextSize(2);
+  gfx.setTextColor(present ? (vcSensorOnline(i) ? C_BAR : C_TEXTDIM) : C_TEXTDIM);
+  gfx.setCursor(x + 8, y + 5);
+  if (present) { gfx.print("S"); gfx.print(vcSensorId(i)); }
+  else         { gfx.print("--"); }
+
+  drawSensValue(i);
+}
+
+static void drawSensButtons() {
+  // SCAN is read-only, so LOCK does not gate it. ZERO moves every reference and
+  // is gated like the sliders and toggles -- LOCK guards what changes state.
+  gfx.fillRect(SCAN_X, BODY_TOP, SENS_BTN_W, SENS_BTN_H, C_ACCENT);
+  gfx.drawRect(SCAN_X, BODY_TOP, SENS_BTN_W, SENS_BTN_H, C_ACCENT_H);
+  gfx.setTextSize(3);
+  gfx.setTextColor(C_WHITE);
+  gfx.setCursor(SCAN_X + (SENS_BTN_W - textW("SCAN", 3)) / 2, BODY_TOP + 9);
+  gfx.print("SCAN");
+
+  gfx.fillRect(ZERO_X, BODY_TOP, SENS_BTN_W, SENS_BTN_H, locked ? C_ACCENT : C_LIVE);
+  gfx.drawRect(ZERO_X, BODY_TOP, SENS_BTN_W, SENS_BTN_H, locked ? C_ACCENT_H : C_LIVE);
+  gfx.setTextSize(3);
+  gfx.setTextColor(locked ? C_TEXTDIM : C_WHITE);
+  gfx.setCursor(ZERO_X + (SENS_BTN_W - textW("ZERO", 3)) / 2, BODY_TOP + 9);
+  gfx.print("ZERO");
+}
+
+// Right of the buttons: how many answered, or that a sweep is running.
+static void drawSensStatus() {
+  int sx = ZERO_X + SENS_BTN_W + PAD;
+  gfx.fillRect(sx, BODY_TOP, SCR_W - PAD - sx, SENS_BTN_H, C_BG);
+
+  char buf[40];
+  if (vcSensorScanning()) snprintf(buf, sizeof(buf), "scanning bus...");
+  else snprintf(buf, sizeof(buf), "%d sensor(s)   mm", vcSensorCount());
+
+  gfx.setTextSize(2);
+  gfx.setTextColor(C_TEXTDIM);
+  gfx.setCursor(sx + 10, BODY_TOP + 13);
+  gfx.print(buf);
+}
+
+// ============================================================
 // Full repaint + dirty redraw
 // ============================================================
 static void drawRow(int k) {
@@ -426,7 +546,16 @@ static void drawRow(int k) {
 static void drawAll() {
   gfx.fillScreen(C_BG);
   drawTopBar();
-  if (curPage == SOL_PAGE) {
+  if (curPage == SENS_PAGE) {
+    drawSensButtons();
+    drawSensStatus();
+    for (int i = 0; i < VC_NUM_SENSORS; i++) {
+      drawSensCell(i);
+      cacheUm[i]     = vcSensorUm(i);
+      cacheSensId[i] = (i < vcSensorCount()) ? vcSensorId(i) : -1;
+      cacheSensOn[i] = vcSensorOnline(i);
+    }
+  } else if (curPage == SOL_PAGE) {
     for (int i = 0; i < VC_NUM_ONOFF; i++) {
       drawSolButton(i);
       cacheSol[i] = vcOnOffGet(i);
@@ -443,6 +572,35 @@ static void drawAll() {
 }
 
 static void renderDirty() {
+  if (curPage == SENS_PAGE) {
+    // Own cadence: a 20-cell text repaint is far heavier than a slider, and the
+    // bus cannot deliver new readings faster than this anyway.
+    uint32_t now = millis();
+    if (cacheValid && (uint32_t)(now - lastSensMs) < SENS_REDRAW_MS) return;
+    lastSensMs = now;
+
+    drawSensStatus();
+    for (int i = 0; i < VC_NUM_SENSORS; i++) {
+      int  id = (i < vcSensorCount()) ? vcSensorId(i) : -1;
+      bool on = vcSensorOnline(i);
+      long um = vcSensorUm(i);
+
+      // A scan can renumber the slots, so the id and the online flag force a
+      // full cell repaint; only the reading changing is a value-only repaint.
+      if (!cacheValid || id != cacheSensId[i] || on != cacheSensOn[i]) {
+        cacheSensId[i] = id;
+        cacheSensOn[i] = on;
+        cacheUm[i]     = um;
+        drawSensCell(i);
+      } else if (um != cacheUm[i]) {
+        cacheUm[i] = um;
+        drawSensValue(i);
+      }
+    }
+    cacheValid = true;
+    return;
+  }
+
   if (curPage == SOL_PAGE) {
     // Serial 'd' commands and the E-STOP both change these behind the UI's
     // back, so the buttons chase the real state exactly as the sliders chase
@@ -562,7 +720,9 @@ static void toggleLock() {
   grabbed = -1;
   drawLockButton();
   // Repaint the body for the live/dim styling -- whichever body is showing.
-  if (curPage == SOL_PAGE) {
+  if (curPage == SENS_PAGE) {
+    drawSensButtons();                       // only ZERO changes appearance
+  } else if (curPage == SOL_PAGE) {
     for (int i = 0; i < VC_NUM_ONOFF; i++) drawSolButton(i);
   } else {
     for (int k = 0; k < VC_GROUP_SIZE; k++) drawSlider(k);
@@ -616,6 +776,19 @@ static void pollTouch() {
     if (!wasTouched) {                       // touch down
       if (ly < TOPBAR_H) {
         handleTopBarTap(lx, ly);
+      } else if (curPage == SENS_PAGE) {
+        // SCAN is read-only and stays live even when locked; ZERO changes every
+        // reference, so it is gated like the sliders and toggles.
+        if (inRect(lx, ly, SCAN_X, BODY_TOP, SENS_BTN_W, SENS_BTN_H)) {
+          vcSensorScan();
+          cacheValid = false;
+          drawAll();
+        } else if (!locked &&
+                   inRect(lx, ly, ZERO_X, BODY_TOP, SENS_BTN_W, SENS_BTN_H)) {
+          vcSensorZero();
+          cacheValid = false;
+          drawAll();
+        }
       } else if (!locked) {                  // LOCK gates the body, not serial
         if (curPage == SOL_PAGE) {
           int i = solAt(lx, ly);

@@ -20,6 +20,7 @@
  */
 #include "encoder_rs485.h"
 #include <string.h>
+#include <math.h>
 
 // GJW group-14 live state block (holding registers).
 static const uint8_t  FN_READ_HOLDING   = 0x03;
@@ -63,6 +64,8 @@ struct Enc {
   uint16_t status;
   uint16_t errors;
   uint16_t badFrames;      // CRC / framing rejects since boot
+  int64_t  zero;           // absolute position captured by zeroAll()
+  bool     hasZero;
 };
 
 static Enc      g_enc[ENC_MAX];
@@ -219,6 +222,15 @@ static void storeState(int idx, const uint8_t *regs) {
   #endif
   #undef REG
   g_enc[idx].online = true;
+
+  // Zero on the first good reading, as ref/sketch_position_speed.ino does.
+  // An un-zeroed absolute position is metres of arbitrary offset, so without
+  // this the page reads "---" until someone presses ZERO. The button re-zeros.
+  if (!g_enc[idx].hasZero) {
+    g_enc[idx].zero    = (int64_t)g_enc[idx].turns * (int64_t)ENC_COUNTS_PER_TURN
+                       + (int64_t)g_enc[idx].singleTurn;
+    g_enc[idx].hasZero = true;
+  }
 }
 
 static int slotOf(uint8_t slave) {
@@ -448,6 +460,44 @@ int32_t  turns(int i)       { return (i >= 0 && i < g_count) ? g_enc[i].turns : 
 int16_t  speed(int i)       { return (i >= 0 && i < g_count) ? g_enc[i].speed : 0; }
 uint16_t statusCode(int i)  { return (i >= 0 && i < g_count) ? g_enc[i].status : 0; }
 uint16_t errorCount(int i)  { return (i >= 0 && i < g_count) ? g_enc[i].errors : 0; }
+
+// Displacement from the zero reference, in micrometres.
+//
+//   um = (absolute - zero) / COUNTS_PER_TURN * PI * DRUM_DIA * 1000
+//
+// Done in double and rounded once at the end: the counts span 2^21 per turn, so
+// the intermediate ratio needs the mantissa. Returns 0 with no zero captured --
+// an un-zeroed absolute position is metres of arbitrary offset, not a length.
+int32_t lengthUm(int i) {
+  if (i < 0 || i >= g_count || !g_enc[i].hasZero) return 0;
+  double rel = (double)(absolute(i) - g_enc[i].zero);
+  double um  = rel / (double)ENC_COUNTS_PER_TURN * M_PI * ENC_DRUM_DIA_MM * 1000.0;
+  if (um >  2147483000.0) return  2147483000L;   // clamp rather than wrap
+  if (um < -2147483000.0) return -2147483000L;
+  return (int32_t)(um >= 0 ? um + 0.5 : um - 0.5);
+}
+
+// Capture the current position of every online encoder as its zero. Offline
+// ones keep whatever they had: re-zeroing on a dropout would silently move the
+// reference of a sensor nobody could read at that moment.
+void zeroAll() {
+  int n = 0;
+  for (int i = 0; i < g_count; i++) {
+    if (!g_enc[i].online) continue;
+    g_enc[i].zero    = absolute(i);
+    g_enc[i].hasZero = true;
+    n++;
+  }
+  Serial.print("Encoders: zeroed ");
+  Serial.print(n);
+  Serial.println(" online encoder(s)");
+}
+
+bool scanning() { return g_scanning; }
+
+bool zeroed(int i) {
+  return (i >= 0 && i < g_count) && g_enc[i].hasZero;
+}
 
 int64_t absolute(int i) {
   if (i < 0 || i >= g_count) return 0;
