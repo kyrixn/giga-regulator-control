@@ -30,8 +30,15 @@
 #pragma once
 #include <Arduino.h>
 
-// Set to 0 to drive setpoints straight through, no undershoot.
-#define APPROACH_ENABLED 1
+// Off. Length from the RS-485 encoders is the primary feedback on this rig and
+// pressure is auxiliary, so 800ms added to every downward move costs more than
+// the hysteresis it removes. Set to 1 to trade that latency back for accuracy
+// if a setpoint ever has to be trusted open-loop.
+//
+// With this off, V2 lands up to ~35 kPa high whenever a setpoint is approached
+// from above. The calibration table still applies; it is simply the ascending
+// table being used in both directions.
+#define APPROACH_ENABLED 0
 
 // How far below the target to dip, in mV of command. Must exceed the valve's
 // hysteresis or the trick does nothing: V2's 36 kPa worst case is ~400mV at
