@@ -87,6 +87,14 @@ static bool     g_hexDump   = false;
 static uint32_t g_rxBytes    = 0;
 static uint32_t g_badFrames  = 0;
 static uint32_t g_echoes     = 0;
+// Transactions that timed out holding SOME bytes that never formed a frame.
+// This is where stray bytes go: counted in g_rxBytes but never reaching
+// acceptFrame(), so "rx bytes high, bad frames ~0" is line noise rather than a
+// garbled reply. Keeping the last few makes which one it is obvious.
+static uint32_t g_partials   = 0;
+static uint32_t g_probes     = 0;
+static uint8_t  g_lastPartial[8];
+static int      g_lastPartialLen = 0;
 static uint32_t g_scanEndMs  = 0;   // when the last fruitless sweep finished
 
 // The request currently in flight, kept so a transceiver echo can be recognised
@@ -134,8 +142,13 @@ static void printI64(int64_t v) {
   while (i > 0) Serial.print(buf[--i]);
 }
 
+// Runtime, not compile-time: which pin the DE wire actually landed on is the
+// single most common thing to get wrong here, and reflashing to try another is
+// a slow way to find out. 'ep<n>' moves it.
+static int g_dePin = ENC_DE_PIN;
+
 static inline void deWrite(bool transmitting) {
-  if (ENC_DE_PIN >= 0) digitalWrite(ENC_DE_PIN, transmitting ? HIGH : LOW);
+  if (g_dePin >= 0) digitalWrite(g_dePin, transmitting ? HIGH : LOW);
 }
 
 // ============================================================
@@ -153,6 +166,7 @@ static void startRequest(uint8_t slave) {
   req[6] = (uint8_t)(crc & 0xFF);       // CRC goes out low byte first
   req[7] = (uint8_t)(crc >> 8);
 
+  g_probes++;
   g_curSlave = slave;
   g_rxLen    = 0;
   g_rxExpect = 0;
@@ -279,12 +293,12 @@ static void finishTransaction(bool ok) {
 namespace enc {
 
 void begin() {
-  if (ENC_DE_PIN >= 0) {
+  if (g_dePin >= 0) {
     // Receive by default: DE must be low before the UART comes up, or this node
     // drives the bus while every other device is trying to talk.
-    digitalWrite(ENC_DE_PIN, LOW);
-    pinMode(ENC_DE_PIN, OUTPUT);
-    digitalWrite(ENC_DE_PIN, LOW);
+    digitalWrite(g_dePin, LOW);
+    pinMode(g_dePin, OUTPUT);
+    digitalWrite(g_dePin, LOW);
   }
   ENC_UART.begin(ENC_BAUD, ENC_PARITY);
 
@@ -404,7 +418,12 @@ void tick() {
         }
       }
       if ((uint32_t)(millis() - g_rxStartMs) >= ENC_RX_TIMEOUT_MS) {
-        if (g_hexDump && g_rxLen) printHexFrame("[enc] RX partial <-", g_rx, g_rxLen);
+        if (g_rxLen) {
+          g_partials++;
+          g_lastPartialLen = g_rxLen < 8 ? g_rxLen : 8;
+          memcpy(g_lastPartial, g_rx, g_lastPartialLen);
+          if (g_hexDump) printHexFrame("[enc] RX partial <-", g_rx, g_rxLen);
+        }
         finishTransaction(false);
       }
       return;
@@ -443,6 +462,9 @@ void rescan(int lo, int hi) {
   g_rxBytes   = 0;
   g_badFrames = 0;
   g_echoes    = 0;
+  g_partials  = 0;
+  g_probes    = 0;
+  g_lastPartialLen = 0;
   for (int i = 0; i < ENC_MAX; i++) g_enc[i] = Enc();
   Serial.print("Encoders: rescanning ids ");
   Serial.print(g_scanLo); Serial.print("-"); Serial.println(g_scanHi);
@@ -478,6 +500,28 @@ void loopbackTest() {
   if (g_testUntilMs == 0) g_testUntilMs = 1;
 }
 
+// Move the DE line to another pin without a reflash.
+void setDePin(int pin) {
+  if (g_dePin >= 0) {
+    pinMode(g_dePin, INPUT);         // release the old one so it cannot fight
+  }
+  g_dePin = pin;
+  if (g_dePin >= 0) {
+    digitalWrite(g_dePin, LOW);
+    pinMode(g_dePin, OUTPUT);
+    digitalWrite(g_dePin, LOW);
+  }
+  Serial.print("Encoders: DE pin now D");
+  if (g_dePin < 0) Serial.println("(none, auto-direction module)");
+  else             Serial.println(g_dePin);
+  if (g_dePin >= 2 && g_dePin <= 7) {
+    Serial.println("  WARNING: D2-D7 drive the on/off solenoids. Both will fight");
+    Serial.println("  for this pin -- move the DE wire or the solenoid wire.");
+  }
+}
+
+int dePin() { return g_dePin; }
+
 void setHexDump(bool on) {
   g_hexDump = on;
   Serial.print("Encoders: frame hex dump ");
@@ -500,6 +544,14 @@ void printAll() {
   Serial.print("  rx bytes "); Serial.print(g_rxBytes);
   Serial.print("  bad frames "); Serial.print(g_badFrames);
   Serial.print("  echoes "); Serial.println(g_echoes);
+  Serial.print("probes "); Serial.print(g_probes);
+  Serial.print("  short timeouts "); Serial.print(g_partials);
+  if (g_probes) {
+    Serial.print("  avg bytes/probe ");
+    Serial.print((float)g_rxBytes / (float)g_probes, 2);
+  }
+  Serial.print("  DE pin D"); Serial.println(g_dePin);
+  if (g_lastPartialLen) printHexFrame("last stray bytes:", g_lastPartial, g_lastPartialLen);
 
   if (g_count == 0) {
     Serial.println("no encoders found.");
@@ -519,11 +571,27 @@ void printAll() {
       Serial.println("   3. A/B swapped, or no 120R at the bus ends?");
       Serial.println("   4. Transceiver powered? RO->D19, DI->D18, GND common?");
       Serial.println("   5. 5V MAX485 drives RO to 5V; the Giga needs 3.3V (MAX3485).");
+    } else if (g_probes && g_rxBytes < g_probes * 3) {
+      // About a byte per probe, never a 13-byte reply. That is an undriven
+      // bus, not an encoder answering badly.
+      Serial.println("  ~1 stray byte per probe, never a reply-sized frame.");
+      Serial.println("  Nothing is driving the bus. Most likely, in order:");
+      Serial.print("   1. DE is not on D"); Serial.print(g_dePin);
+      Serial.println(". The reference sketch used the Mega's");
+      Serial.println("      pin 2 -- if that wire moved across unchanged it is on");
+      Serial.println("      the Giga's D2, which this build drives as solenoid d0.");
+      Serial.println("      A DE held high is transmit-only: the encoder hears us");
+      Serial.println("      but we are deaf to it, and RO floats into noise.");
+      Serial.println("      'ep<n>' moves the DE pin live, e.g. ep2 or ep10.");
+      Serial.println("   2. A/B swapped, so the encoder cannot decode the request.");
+      Serial.println("   3. No failsafe bias on A/B (~560R-1k) -- that is what");
+      Serial.println("      turns an idle bus into these stray bytes.");
+      Serial.println("  'el' listens without transmitting: stray bytes while idle");
+      Serial.println("  confirms 3; silence means the noise is DE switching.");
     } else {
-      Serial.println("  bytes ARE arriving but nothing validated:");
+      Serial.println("  reply-sized traffic but nothing validated:");
       Serial.println("   - baud or parity mismatch? this build is 115200 8N1.");
       Serial.println("   - run 'ex' then 'es' to see the raw frames.");
-      Serial.println("   - run 'el' to dump the bus unframed.");
     }
     return;
   }

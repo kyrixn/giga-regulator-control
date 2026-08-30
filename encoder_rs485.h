@@ -105,6 +105,8 @@ namespace enc {
   uint32_t echoes();              // frames recognised as our own request coming back
 
   void printAll();                // the 'e' command: raw values for every encoder
+  void setDePin(int pin);         // 'ep<n>': move DE without a reflash, -1 = none
+  int  dePin();
   void listen(uint32_t ms);       // 'el': dump everything the UART hears, unframed
   void loopbackTest();            // 'et': prove the UART itself works
   void rescan();                  // the 'es' command: sweep the current range

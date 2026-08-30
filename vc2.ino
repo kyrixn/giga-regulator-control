@@ -50,6 +50,7 @@
  *     e                  Raw values for every encoder found
  *     es                 Re-sweep the slave-id range
  *     es<lo>,<hi>        Re-sweep a different id range, e.g. es50,80
+ *     ep<n>              Move the DE line to pin n live (ep10, ep2, ep-1=none)
  *     el                 Dump the bus unframed for 3s (raw hex)
  *     et                 Loopback self-test (jumper D18 to D19 first)
  *     ex                 Toggle hex dump of every Modbus frame
@@ -449,6 +450,13 @@ void processSerialCommand() {
           return;
         }
 
+        // 'ep<n>' moves the RS-485 DE line to pin n (ep-1 = auto-direction).
+        if (cmdLower.startsWith("ep") && cmdLower.length() > 2) {
+          enc::setDePin(cmdLower.substring(2).toInt());
+          inputBuffer = "";
+          return;
+        }
+
         if (cmdLower == "el") {
           enc::listen(3000);        // dump the bus unframed for 3s
           inputBuffer = "";
@@ -687,7 +695,8 @@ void setup() {
   Serial.print(DV_ACTIVE_LOW ? "LOW" : "HIGH");
   Serial.println(")");
   Serial.println("Commands: valve,value | dN,0|1 | s=stop | ?=status | d?=on/off status");
-  Serial.println("          e=encoders | es=rescan | el=listen | et=loopback | ex=hex");
+  Serial.println("          e=encoders | es=rescan | el=listen | et=loopback");
+  Serial.println("          ep<n>=DE pin | ex=hex dump");
   Serial.println("          p=ping | a=ADC dump | i=I2C scan");
 
   // Bring up the touchscreen UI last, so valve state already reflects a clean
