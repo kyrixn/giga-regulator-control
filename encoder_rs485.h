@@ -88,7 +88,15 @@ namespace enc {
   uint16_t statusCode(int i);
   uint16_t errorCount(int i);
 
+  // Bus-level counters, for telling "nothing is reaching the UART" apart from
+  // "bytes arrive but nothing validates". The two have disjoint causes.
+  uint32_t rxBytes();
+  uint32_t badFrames();
+  uint32_t echoes();              // frames recognised as our own request coming back
+
   void printAll();                // the 'e' command: raw values for every encoder
+  void listen(uint32_t ms);       // 'el': dump everything the UART hears, unframed
+  void loopbackTest();            // 'et': prove the UART itself works
   void rescan();                  // the 'es' command: sweep the current range
   void rescan(int lo, int hi);    // 'es<lo>,<hi>': sweep a different range
   int  scanLo();

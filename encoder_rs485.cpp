@@ -19,6 +19,7 @@
  * polling all 31 every cycle would dominate the loop.
  */
 #include "encoder_rs485.h"
+#include <string.h>
 
 // GJW group-14 live state block (holding registers).
 static const uint8_t  FN_READ_HOLDING   = 0x03;
@@ -30,6 +31,15 @@ static const int RESP_MAX = 64;
 
 static const uint32_t ENC_GAP_US        = 500;   // >= 3.5 char times at 115200
 static const uint32_t ENC_RX_TIMEOUT_MS = 50;    // matches the webapp's 0.06s
+
+// Extra byte-times DE is held past the computed end of transmission. Must stay
+// under the 3.5 char times (~304us at 115200) a Modbus slave waits before it
+// replies, or we are still driving the bus when the answer starts. Two bytes
+// leaves ~130us of margin.
+static const uint32_t ENC_TX_GUARD_BYTES = 2;
+
+// Nothing answered the sweep: retry this often rather than sitting dead.
+static const uint32_t ENC_RESCAN_MS = 5000;
 
 // ---- Per-encoder state ----------------------------------------------------
 struct Enc {
@@ -67,6 +77,24 @@ static uint32_t g_gapStartUs = 0;
 static uint32_t g_rxStartMs = 0;
 
 static bool     g_hexDump   = false;
+
+// Bus-level diagnostics. Zero bytes ever received means nothing is reaching the
+// UART at all; bytes arriving with nothing validating means it hears but does
+// not understand; echoes means /RE is not following DE.
+static uint32_t g_rxBytes    = 0;
+static uint32_t g_badFrames  = 0;
+static uint32_t g_echoes     = 0;
+static uint32_t g_scanEndMs  = 0;   // when the last fruitless sweep finished
+
+// The request currently in flight, kept so a transceiver echo can be recognised
+// byte-for-byte rather than guessed at from its length.
+static uint8_t  g_req[8];
+
+// 'el' raw-listen and 'et' loopback modes suspend the state machine.
+static uint32_t g_listenUntilMs = 0;
+static uint32_t g_testUntilMs   = 0;
+static int      g_testGot       = 0;
+static const uint8_t TEST_PATTERN[6] = { 0x55, 0xAA, 0x00, 0xFF, 0x5A, 0xA5 };
 
 // ============================================================
 // Modbus helpers
@@ -125,17 +153,25 @@ static void startRequest(uint8_t slave) {
   g_curSlave = slave;
   g_rxLen    = 0;
   g_rxExpect = 0;
+  memcpy(g_req, req, sizeof(req));
 
   while (ENC_UART.available()) ENC_UART.read();   // drop any stale bytes
 
   deWrite(true);
+
+  // Stamp the clock BEFORE the write, not after. Whether write() buffers and
+  // returns at once or blocks until the bytes are out, the deadline then
+  // measures from the instant transmission began: buffered, we hold the full
+  // byte-time; blocking, the time is already spent and DE drops immediately.
+  // Stamping afterwards adds a second transmission's worth of hold on a
+  // blocking core and talks straight over the encoder's reply.
+  g_txStartUs = micros();
   ENC_UART.write(req, sizeof(req));
 
-  // Hold DE for the time the bytes need on the wire, plus a byte of slack.
-  // 10 bits per byte (start + 8 + stop).
-  g_txStartUs = micros();
-  g_txHoldUs  = ((uint32_t)(sizeof(req) + 1) * 10UL * 1000000UL) / ENC_BAUD;
-  g_state     = ST_TX;
+  // 10 bits per byte on the wire (start + 8 data + stop).
+  g_txHoldUs = ((uint32_t)(sizeof(req) + ENC_TX_GUARD_BYTES) * 10UL * 1000000UL)
+               / ENC_BAUD;
+  g_state    = ST_TX;
 
   if (g_hexDump) printHexFrame("[enc] TX ->", req, sizeof(req));
 }
@@ -158,18 +194,29 @@ static int slotOf(uint8_t slave) {
   return -1;
 }
 
+// True if what we just collected is our own request coming back. Happens when
+// the transceiver's /RE is not tied to DE, so the receiver stays enabled while
+// we transmit. Recognised byte-for-byte rather than by length: our request is a
+// well-formed Modbus frame with a valid CRC, so it survives every other check
+// and would otherwise be counted as a protocol error and hide the real cause.
+static bool isEcho() {
+  return g_rxLen == (int)sizeof(g_req) && memcmp(g_rx, g_req, sizeof(g_req)) == 0;
+}
+
 // Validate the frame sitting in g_rx. Returns true if it was stored.
 static bool acceptFrame() {
   if (g_hexDump) printHexFrame("[enc] RX <-", g_rx, g_rxLen);
 
-  if (g_rxLen < 5) return false;
+  // Anything that arrived but did not validate is counted: that is the signal
+  // the bus is alive and the misunderstanding is in baud/parity/protocol.
+  if (g_rxLen < 5)                    { g_badFrames++; return false; }
   uint16_t want = modbusCrc(g_rx, g_rxLen - 2);
   uint16_t got  = (uint16_t)g_rx[g_rxLen - 2] | ((uint16_t)g_rx[g_rxLen - 1] << 8);
-  if (want != got)              return false;
-  if (g_rx[0] != g_curSlave)    return false;
-  if (g_rx[1] & 0x80)           return false;   // Modbus exception frame
-  if (g_rx[1] != FN_READ_HOLDING) return false;
-  if (g_rx[2] != GJW_STATE_COUNT * 2) return false;
+  if (want != got)                    { g_badFrames++; return false; }
+  if (g_rx[0] != g_curSlave)          { g_badFrames++; return false; }
+  if (g_rx[1] & 0x80)                 { g_badFrames++; return false; }  // exception
+  if (g_rx[1] != FN_READ_HOLDING)     { g_badFrames++; return false; }
+  if (g_rx[2] != GJW_STATE_COUNT * 2) { g_badFrames++; return false; }
 
   int idx = slotOf(g_curSlave);
   if (idx < 0) {
@@ -201,7 +248,12 @@ static void finishTransaction(bool ok) {
         Serial.print(g_enc[i].slave);
       }
       Serial.print(") in ids ");
-      Serial.print(g_scanLo); Serial.print("-"); Serial.println(g_scanHi);
+      Serial.print(g_scanLo); Serial.print("-"); Serial.print(g_scanHi);
+      Serial.print("  [rx bytes "); Serial.print(g_rxBytes);
+      Serial.print(", bad frames "); Serial.print(g_badFrames);
+      Serial.print(", echoes "); Serial.print(g_echoes);
+      Serial.println("]");
+      g_scanEndMs = millis();
     }
   } else {
     int idx = slotOf(g_curSlave);
@@ -239,6 +291,58 @@ void begin() {
 }
 
 void tick() {
+  // 'el': pure receive. Dumps whatever lands on the UART with no framing at
+  // all, so a bus driven by some other master (or a scope-less sanity check on
+  // baud) shows up even when nothing here validates.
+  if (g_listenUntilMs) {
+    while (ENC_UART.available()) {
+      uint8_t b = (uint8_t)ENC_UART.read();
+      g_rxBytes++;
+      if (b < 0x10) Serial.print(" 0"); else Serial.print(' ');
+      Serial.print(b, HEX);
+    }
+    if ((int32_t)(millis() - g_listenUntilMs) >= 0) {
+      g_listenUntilMs = 0;
+      Serial.println();
+      Serial.print("Encoders: listen done, ");
+      Serial.print(g_rxBytes);
+      Serial.println(" byte(s) total since the last rescan");
+      g_gapStartUs = micros();
+      g_state = ST_GAP;
+    }
+    return;
+  }
+
+  // 'et': loopback. Proves the UART, the baud rate and the two pins work
+  // without any encoder or transceiver in the picture.
+  if (g_testUntilMs) {
+    while (ENC_UART.available()) {
+      uint8_t b = (uint8_t)ENC_UART.read();
+      if (g_testGot < (int)sizeof(TEST_PATTERN) && b == TEST_PATTERN[g_testGot]) {
+        g_testGot++;
+      }
+    }
+    if (g_testGot >= (int)sizeof(TEST_PATTERN)) {
+      g_testUntilMs = 0;
+      Serial.println("Encoders: LOOPBACK PASS - the UART, baud and pins are fine.");
+      Serial.println("  So the fault is past the Giga: transceiver, DE, A/B, or the bus.");
+      g_gapStartUs = micros();
+      g_state = ST_GAP;
+    } else if ((int32_t)(millis() - g_testUntilMs) >= 0) {
+      g_testUntilMs = 0;
+      Serial.print("Encoders: LOOPBACK FAIL - got ");
+      Serial.print(g_testGot);
+      Serial.print(" of ");
+      Serial.print((int)sizeof(TEST_PATTERN));
+      Serial.println(" pattern byte(s).");
+      Serial.println("  With D18 jumpered to D19 this must pass. If it does not,");
+      Serial.println("  the UART or the pins are wrong, not the RS-485 side.");
+      g_gapStartUs = micros();
+      g_state = ST_GAP;
+    }
+    return;
+  }
+
   switch (g_state) {
 
     case ST_GAP:
@@ -248,7 +352,12 @@ void tick() {
       } else if (g_count > 0) {
         startRequest(g_enc[g_pollIdx].slave);
       } else {
-        // Nothing answered the sweep. Idle here; 'es' restarts a scan.
+        // Nothing answered. Retry on a timer rather than sitting dead, so
+        // plugging the bus in after boot is enough to bring it up.
+        if ((uint32_t)(millis() - g_scanEndMs) >= ENC_RESCAN_MS) {
+          g_scanning = true;
+          g_scanId   = g_scanLo;
+        }
         g_gapStartUs = micros();
       }
       return;
@@ -263,6 +372,7 @@ void tick() {
     case ST_RX: {
       while (ENC_UART.available() && g_rxLen < RESP_MAX) {
         g_rx[g_rxLen++] = (uint8_t)ENC_UART.read();
+        g_rxBytes++;
         // Byte 2 carries the payload size, so the total length is known as
         // soon as the header lands -- exception frames are 5 bytes total.
         if (g_rxLen == 3) {
@@ -270,6 +380,16 @@ void tick() {
           if (g_rxExpect > RESP_MAX) g_rxExpect = RESP_MAX;
         }
         if (g_rxExpect && g_rxLen >= g_rxExpect) {
+          if (isEcho()) {
+            // Our own request came back. Drop it, restart the receive window
+            // and keep listening -- the encoder's reply is still to come.
+            g_echoes++;
+            if (g_hexDump) printHexFrame("[enc] echo <-", g_rx, g_rxLen);
+            g_rxLen = 0;
+            g_rxExpect = 0;
+            g_rxStartMs = millis();
+            continue;
+          }
           finishTransaction(acceptFrame());
           return;
         }
@@ -311,6 +431,9 @@ void rescan(int lo, int hi) {
   g_scanning = true;
   g_scanId   = g_scanLo;
   g_pollIdx  = 0;
+  g_rxBytes   = 0;
+  g_badFrames = 0;
+  g_echoes    = 0;
   for (int i = 0; i < ENC_MAX; i++) g_enc[i] = Enc();
   Serial.print("Encoders: rescanning ids ");
   Serial.print(g_scanLo); Serial.print("-"); Serial.println(g_scanHi);
@@ -320,6 +443,31 @@ void rescan() { rescan(g_scanLo, g_scanHi); }
 
 int scanLo() { return g_scanLo; }
 int scanHi() { return g_scanHi; }
+
+uint32_t rxBytes()   { return g_rxBytes; }
+uint32_t badFrames() { return g_badFrames; }
+uint32_t echoes()    { return g_echoes; }
+
+void listen(uint32_t ms) {
+  while (ENC_UART.available()) ENC_UART.read();
+  g_listenUntilMs = millis() + ms;
+  if (g_listenUntilMs == 0) g_listenUntilMs = 1;   // 0 is the "off" sentinel
+  Serial.print("Encoders: listening on D18/D19 for ");
+  Serial.print(ms);
+  Serial.println(" ms (no framing, raw hex):");
+}
+
+void loopbackTest() {
+  Serial.println("Encoders: loopback test -- jumper D18 to D19 first.");
+  // DE stays low so an attached transceiver keeps its receiver on and its
+  // driver off; with a direct jumper the transceiver plays no part either way.
+  deWrite(false);
+  while (ENC_UART.available()) ENC_UART.read();
+  g_testGot = 0;
+  ENC_UART.write(TEST_PATTERN, sizeof(TEST_PATTERN));
+  g_testUntilMs = millis() + 200;
+  if (g_testUntilMs == 0) g_testUntilMs = 1;
+}
 
 void setHexDump(bool on) {
   g_hexDump = on;
@@ -338,10 +486,36 @@ void printAll() {
     Serial.print("scanning... at id ");
     Serial.println(g_scanId);
   }
+  Serial.print("range "); Serial.print(g_scanLo);
+  Serial.print("-"); Serial.print(g_scanHi);
+  Serial.print("  rx bytes "); Serial.print(g_rxBytes);
+  Serial.print("  bad frames "); Serial.print(g_badFrames);
+  Serial.print("  echoes "); Serial.println(g_echoes);
+
   if (g_count == 0) {
-    Serial.print("no encoders found in ids ");
-    Serial.print(g_scanLo); Serial.print("-"); Serial.println(g_scanHi);
-    Serial.println("check A/B polarity, 120R termination, DE wiring, baud 115200 8N1");
+    Serial.println("no encoders found.");
+    if (g_echoes > 0) {
+      Serial.println("  ECHO: our own request is coming back, so /RE is not");
+      Serial.print("  following DE. Tie /RE to DE (both to D");
+      Serial.print(ENC_DE_PIN);
+      Serial.println("). Echo is now");
+      Serial.println("  discarded rather than mistaken for a reply, but the");
+      Serial.println("  encoder still never answers if it never heard us.");
+    } else if (g_rxBytes == 0) {
+      // Not one edge got through: the fault is upstream of the protocol.
+      Serial.println("  NOTHING received at all. In likelihood order:");
+      Serial.print("   1. DE+/RE wired to D"); Serial.print(ENC_DE_PIN);
+      Serial.println("? Floating or stuck high = transmit-only, deaf.");
+      Serial.println("   2. Run 'et' with D18 jumpered to D19 to prove the UART.");
+      Serial.println("   3. A/B swapped, or no 120R at the bus ends?");
+      Serial.println("   4. Transceiver powered? RO->D19, DI->D18, GND common?");
+      Serial.println("   5. 5V MAX485 drives RO to 5V; the Giga needs 3.3V (MAX3485).");
+    } else {
+      Serial.println("  bytes ARE arriving but nothing validated:");
+      Serial.println("   - baud or parity mismatch? this build is 115200 8N1.");
+      Serial.println("   - run 'ex' then 'es' to see the raw frames.");
+      Serial.println("   - run 'el' to dump the bus unframed.");
+    }
     return;
   }
   Serial.println("slave  on  single_turn      turns    absolute  speed  stat  err  bad");

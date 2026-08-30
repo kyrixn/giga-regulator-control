@@ -50,6 +50,8 @@
  *     e                  Raw values for every encoder found
  *     es                 Re-sweep the slave-id range
  *     es<lo>,<hi>        Re-sweep a different id range, e.g. es50,80
+ *     el                 Dump the bus unframed for 3s (raw hex)
+ *     et                 Loopback self-test (jumper D18 to D19 first)
  *     ex                 Toggle hex dump of every Modbus frame
  *   s                  Emergency stop (regulators AND on/off valves)
  *   p                  Ping test
@@ -447,6 +449,18 @@ void processSerialCommand() {
           return;
         }
 
+        if (cmdLower == "el") {
+          enc::listen(3000);        // dump the bus unframed for 3s
+          inputBuffer = "";
+          return;
+        }
+
+        if (cmdLower == "et") {
+          enc::loopbackTest();      // D18 jumpered to D19 must pass
+          inputBuffer = "";
+          return;
+        }
+
         if (cmdLower == "ex") {
           enc::setHexDump(!enc::hexDump());
           inputBuffer = "";
@@ -673,7 +687,7 @@ void setup() {
   Serial.print(DV_ACTIVE_LOW ? "LOW" : "HIGH");
   Serial.println(")");
   Serial.println("Commands: valve,value | dN,0|1 | s=stop | ?=status | d?=on/off status");
-  Serial.println("          e=encoders | es=rescan | ex=hex dump");
+  Serial.println("          e=encoders | es=rescan | el=listen | et=loopback | ex=hex");
   Serial.println("          p=ping | a=ADC dump | i=I2C scan");
 
   // Bring up the touchscreen UI last, so valve state already reflects a clean
