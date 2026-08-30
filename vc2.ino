@@ -152,27 +152,31 @@ bool initValves() {
 
   // Initialize each unique DAC (indices 0, 2, 4, ..., NUM_VALVES-2)
   for (int i = 0; i < NUM_VALVES; i += 2) {
-    if (dacs[i]->begin() != 0) {
-      // begin() failed == no ACK at this address. Print the address so a bad
-      // jumper is distinguishable from a dead bus.
-      Serial.print("ERROR: DAC init failed for valves ");
-      Serial.print(i);
-      Serial.print(" and ");
-      Serial.print(i + 1);
-      Serial.print("  (no ACK at 0x");
-      Serial.print(DAC_ADDR_BASE + i / 2, HEX);
-      Serial.println(" on Wire)");
-      success = false;
-    } else {
-      dacs[i]->setDACOutRange(DFRobot_GP8403::eOutputRange10V);
-      Serial.print("DAC initialized for valves ");
-      Serial.print(i);
-      Serial.print(" and ");
-      Serial.print(i + 1);
-      Serial.print("  (0x");
-      Serial.print(DAC_ADDR_BASE + i / 2, HEX);
-      Serial.println(")");
-    }
+    bool ok = (dacs[i]->begin() == 0);
+
+    // Set the range unconditionally, even when begin() failed.
+    //
+    // The library converts mV to a DAC code by dividing by an internal
+    // `voltage` member, and setDACOutRange() is the only thing that ever sets
+    // it -- it starts at 0. Skip this call and every later setDACOutVoltage()
+    // computes data/0, producing one fixed code no matter what value is asked
+    // for. The output then sticks at some arbitrary level while commands are
+    // still accepted and '?' still shows the setpoint changing, which makes it
+    // look like a wiring fault anywhere except here. Setting the range even on
+    // a failed probe also means a DAC that was merely unplugged at boot starts
+    // working the moment it is plugged back in.
+    dacs[i]->setDACOutRange(DFRobot_GP8403::eOutputRange10V);
+
+    Serial.print(ok ? "DAC initialized for valves "
+                    : "ERROR: DAC init failed for valves ");
+    Serial.print(i);
+    Serial.print(" and ");
+    Serial.print(i + 1);
+    Serial.print("  (0x");
+    Serial.print(DAC_ADDR_BASE + i / 2, HEX);
+    Serial.println(ok ? ")" : " did not ACK on Wire)");
+
+    if (!ok) success = false;
   }
 
   // Set all valves to 0 initially
