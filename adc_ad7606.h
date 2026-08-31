@@ -21,7 +21,7 @@
 
 // Boards wired. Start at 1 for single-board bring-up; set to 4 for the full
 // 32-channel setup (CS pins D41..D44, BUSY pins D45..D48).
-#define ADC_NUM_BOARDS   2
+#define ADC_NUM_BOARDS   4
 #define ADC_CH_PER_BOARD 8
 #define ADC_NUM_CH       (ADC_NUM_BOARDS * ADC_CH_PER_BOARD)
 
