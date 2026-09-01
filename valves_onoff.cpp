@@ -70,10 +70,10 @@ int activeCount() {
 // starts with V and contains '=' and '|' as a full regulator snapshot and
 // clears its table from it, so the on/off valves must not look like one.
 void printStatus() {
-  Serial.println("=== On/Off valves: d0-d5 = pins D2-D7 ===");
+  Serial.println("=== On/Off valves: d2-d7 (number = Giga pin) ===");
   for (int i = 0; i < DV_NUM_VALVES; i++) {
     Serial.print("D");
-    Serial.print(i);
+    Serial.print(DV_PINS[i]);
     Serial.print("=");
     Serial.print(g_on[i] ? 1 : 0);
     if (i < DV_NUM_VALVES - 1) Serial.print(" | ");

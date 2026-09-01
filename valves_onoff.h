@@ -23,6 +23,11 @@
 
 #define DV_NUM_VALVES 6
 
+// First Giga pin of the D2..D7 block. Serial 'd' commands and the display both
+// name a valve by its PIN number (d2..d7), while dv:: itself counts 0..5, so
+// every user-facing surface converts with this offset.
+#define DV_PIN_FIRST 2
+
 // Driver polarity. Optocoupler input boards are almost always active-LOW: the
 // IN pin sinks current through the opto LED, so pulling IN to GND energises the
 // channel and driving it high releases the valve. Set this to 0 if the bench

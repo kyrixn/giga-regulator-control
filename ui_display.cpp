@@ -216,7 +216,7 @@ static void tabRect(int i, int &x, int &y, int &w, int &h) {
 }
 
 // Button i on the solenoid page: VC_GROUP_SIZE rows of two, reading
-// left-to-right then down, so d0..d5 land where the eye expects them.
+// left-to-right then down, so d2..d7 land where the eye expects them.
 static void solRect(int i, int &x, int &y, int &w, int &h) {
   x = (i % 2) ? RIGHT_X : LEFT_X;
   y = rowY(i / 2);
@@ -430,10 +430,10 @@ static void drawSolButton(int i) {
   gfx.setTextColor(C_TEXT);
   gfx.setTextSize(3);
   gfx.setCursor(x + 14, y + 12);
-  gfx.print("d"); gfx.print(i);
+  gfx.print("d"); gfx.print(vcOnOffPin(i));
 
-  // The index is NOT the pin number (d0 drives D2), so the button carries both
-  // and there is nothing left to misremember at the panel.
+  // The number IS the pin (d2 drives D2), and the sub-label spells it out so
+  // there is nothing left to misremember at the panel.
   char buf[12];
   snprintf(buf, sizeof(buf), "pin D%d", vcOnOffPin(i));
   gfx.setTextColor(C_TEXTDIM);

@@ -41,9 +41,9 @@
  *     v1,val1,v2,val2,.. Set several:   0,3000,4,2500
  *     valve,off          Release one:   4,off
  *     ?                  Status of all 6 regulators
- *   On/off valves ('d' prefix, index 0..5 -> D2..D7):
- *     dN,V               Set one:       d0,1  d0,on  d0,0  d0,off
- *     dN,V,dM,V,..       Set several:   d0,1,d3,0
+ *   On/off valves ('d' prefix, index 2..7 = the Giga pin number, D2..D7):
+ *     dN,V               Set one:       d2,1  d2,on  d2,0  d2,off
+ *     dN,V,dM,V,..       Set several:   d2,1,d5,0
  *     d,off              Release all on/off valves
  *     d  or  d?          Status of all 6 on/off valves
  *   RS-485 encoders:
@@ -550,7 +550,7 @@ void processSerialCommand() {
         }
 
         // Any other line starting with 'd' is an on/off-valve command. Checked
-        // before parseCommand() so "d0,1" can never be read as regulator 0.
+        // before parseCommand() so "d2,1" can never be read as regulator 2.
         if (cmdLower.length() > 1 && cmdLower[0] == 'd') {
           parseDigitalCommand(inputBuffer);
           inputBuffer = "";
@@ -619,12 +619,12 @@ void parseCommand(String cmd) {
 }
 
 /**
- * Parse an on/off-valve line: dN,V where V is 1/0/on/off. Several pairs may
- * share a line: d0,1,d3,0
+ * Parse an on/off-valve line: dN,V where V is 1/0/on/off and N is the Giga
+ * PIN number (d2..d7 -> D2..D7). Several pairs may share a line: d2,1,d5,0
  *
  * The 'd' rides on the index token rather than the line as a whole, so a mixed
  * or malformed line still names the valve it is talking about, and a dropped
- * character cannot silently turn "d0,1" into regulator 0 at 1 mV.
+ * character cannot silently turn "d2,1" into regulator 2 at 1 mV.
  */
 void parseDigitalCommand(String cmd) {
   cmd.trim();
@@ -641,7 +641,10 @@ void parseDigitalCommand(String cmd) {
     if (idxTok.length() > 0 && (idxTok[0] == 'd' || idxTok[0] == 'D')) {
       idxTok = idxTok.substring(1);
     }
-    int valve = idxTok.toInt();
+    // The user-facing number IS the Giga pin (d2..d7); dv:: still counts 0..5,
+    // so shift by DV_PIN_FIRST on the way in and echo the pin number back out.
+    int pinNum = idxTok.toInt();
+    int valve = pinNum - DV_PIN_FIRST;
 
     int comma2 = cmd.indexOf(',', comma1 + 1);
     String valTok;
@@ -664,7 +667,7 @@ void parseDigitalCommand(String cmd) {
       on = false;
     } else {
       Serial.print("ERROR: D");
-      Serial.print(valve);
+      Serial.print(pinNum);
       Serial.print(" bad value '");
       Serial.print(valTok);
       Serial.println("' - use 0/1/on/off");
@@ -674,12 +677,16 @@ void parseDigitalCommand(String cmd) {
 
     if (dv::set(valve, on)) {
       Serial.print("OK: D");
-      Serial.print(valve);
+      Serial.print(pinNum);
       Serial.print("=");
       Serial.print(on ? 1 : 0);
     } else {
       Serial.print("ERROR: Invalid on/off valve index ");
-      Serial.print(valve);
+      Serial.print(pinNum);
+      Serial.print(" - use d");
+      Serial.print(DV_PIN_FIRST);
+      Serial.print("..d");
+      Serial.print(DV_PIN_FIRST + DV_NUM_VALVES - 1);
     }
 
     count++;
@@ -689,7 +696,7 @@ void parseDigitalCommand(String cmd) {
   if (count > 0) {
     Serial.println();
   } else {
-    Serial.println("ERROR: Use dN,V with V = 0/1/on/off, e.g. d0,1");
+    Serial.println("ERROR: Use dN,V with V = 0/1/on/off and N = pin, e.g. d2,1");
   }
 }
 
@@ -753,7 +760,7 @@ void setup() {
   #endif
   Serial.println("Layout: V0-V5 on Wire (DAC 0x58-0x5A)");
   Serial.println("Regulator: cmd 0-10V = 0-900 kPa | monitor 1-5V = 0-900 kPa");
-  Serial.print("On/off valves: D0-D5 on pins D2-D7, all OFF (driver active-");
+  Serial.print("On/off valves: d2-d7 = pins D2-D7, all OFF (driver active-");
   Serial.print(DV_ACTIVE_LOW ? "LOW" : "HIGH");
   Serial.println(")");
   Serial.println("Commands: valve,value | dN,0|1 | s=stop | ?=status | d?=on/off status");

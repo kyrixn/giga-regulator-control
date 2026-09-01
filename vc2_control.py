@@ -19,9 +19,9 @@ Commands:
     valve,off            - Turn off a valve: 4,off
     ?                    - Query status of all regulators
 
-  On/off solenoids (indices 0..5 == Giga pins D2..D7):
-    dN,V                 - Set one: d0,1  d0,on  d0,0  d0,off
-    dN,V,dM,V,...        - Set several: d0,1,d3,0
+  On/off solenoids (number = Giga pin, d2..d7 == pins D2..D7):
+    dN,V                 - Set one: d2,1  d2,on  d2,0  d2,off
+    dN,V,dM,V,...        - Set several: d2,1,d5,0
     d,off                - Release every on/off valve
     d  or  d?            - Query status of all on/off valves
 
@@ -63,12 +63,12 @@ CMD_MV_FS   = 10000     # command mV at KPA_MAX
 # would be 900 kPa; this ceiling deliberately stops at ~200 kPa.
 MAX_INPUT_VALUE = 2200  # mV or kPa — never send values above this (198 kPa)
 
-# On/off solenoids on the opto-isolated MOSFET board. NOTE the numbering: these
-# are indices 0..5, matching the regulators' 0..5, and they map onto Giga pins
-# D2..D7. So 'd0' drives pin D2 and 'd5' drives pin D7 -- the index is not the
-# pin number. Firmware side: DV_NUM_VALVES / DV_PINS in valves_onoff.h/.cpp.
+# On/off solenoids on the opto-isolated MOSFET board. The user-facing number
+# IS the Giga pin: 'd2' drives pin D2 and 'd7' drives pin D7. Internally (and
+# in the firmware's dv::) they are still indices 0..5, so ONOFF_PIN0 is the
+# protocol offset. Firmware side: DV_PIN_FIRST in valves_onoff.h.
 NUM_ONOFF   = 6
-ONOFF_PIN0  = 2         # index 0 -> D2, for display labels only
+ONOFF_PIN0  = 2         # internal index 0 <-> d2/D2 on the wire and screen
 
 
 def bus_name(valve):
@@ -184,11 +184,12 @@ class ValveController:
                 with self.display_lock:
                     self.valve_data.pop(v, None)
 
-            # "D<i>=<0|1>" -> on/off solenoid ack. Deliberately a separate
+            # "D<pin>=<0|1>" -> on/off solenoid ack. Deliberately a separate
             # letter from V so neither regex can ever match the other's acks.
+            # The wire carries pin numbers (D2..D7); onoff_data keys stay 0..5.
             for m in re.findall(r'D(\d+)=([01])', line):
                 with self.display_lock:
-                    self.onoff_data[int(m[0])] = (m[1] == '1')
+                    self.onoff_data[int(m[0]) - ONOFF_PIN0] = (m[1] == '1')
 
             if "all on/off valves OFF" in line:
                 with self.display_lock:
@@ -210,11 +211,11 @@ class ValveController:
             self.message_queue.append(line)
             return
 
-        # On/off status response: "D0=0 | D1=1 | ... | D5=0"
+        # On/off status response: "D2=0 | D3=1 | ... | D7=0" (pin numbers)
         if line.startswith("D") and "=" in line and "|" in line:
             with self.display_lock:
                 self.onoff_data = {
-                    int(m[0]): (m[1] == '1')
+                    int(m[0]) - ONOFF_PIN0: (m[1] == '1')
                     for m in re.findall(r'D(\d+)=([01])', line)
                 }
             self.message_queue.append(line)
@@ -307,9 +308,10 @@ class ValveController:
     def set_onoff(self, pairs):
         """Set one or more on/off solenoids.
 
-        pairs: list of (index, bool). Sent as a single 'd0,1,d3,0' line so the
-        valves switch in one pass of the firmware's command parser rather than
-        staggered across several serial round-trips.
+        pairs: list of (internal index 0..5, bool). Sent as a single
+        'd2,1,d5,0' line (pin-numbered on the wire) so the valves switch in one
+        pass of the firmware's command parser rather than staggered across
+        several serial round-trips.
         """
         for idx, _ in pairs:
             if not 0 <= idx < NUM_ONOFF:
@@ -317,7 +319,7 @@ class ValveController:
                     f"[ERR] On/off index {idx} out of range (0..{NUM_ONOFF - 1})"
                 )
                 return False
-        cmd = ",".join(f"d{idx},{1 if on else 0}" for idx, on in pairs)
+        cmd = ",".join(f"d{idx + ONOFF_PIN0},{1 if on else 0}" for idx, on in pairs)
         return self.send(cmd)
 
     def onoff_all_off(self):
@@ -432,16 +434,15 @@ class LiveDisplay:
     def _style_onoff_axes(self, ax):
         ax.set_facecolor(self.colors['panel'])
         ax.set_title(
-            f'On/Off solenoids  d0-d{NUM_ONOFF - 1}  '
-            f'(Giga pins D{ONOFF_PIN0}-D{ONOFF_PIN0 + NUM_ONOFF - 1})',
+            f'On/Off solenoids  d{ONOFF_PIN0}-d{ONOFF_PIN0 + NUM_ONOFF - 1}  '
+            f'(= Giga pins D{ONOFF_PIN0}-D{ONOFF_PIN0 + NUM_ONOFF - 1})',
             color=self.colors['text'], fontsize=12,
             fontfamily='monospace', loc='left')
         ax.set_xlim(-0.5, NUM_ONOFF - 0.5)
         ax.set_ylim(0, 1)
         ax.set_xticks(range(NUM_ONOFF))
-        # Label with both numbers, because the index and the pin differ by two
-        # and mixing them up actuates the wrong valve.
-        ax.set_xticklabels([f'd{i}\nD{ONOFF_PIN0 + i}' for i in range(NUM_ONOFF)])
+        # The number is the pin, so one label says it all.
+        ax.set_xticklabels([f'd{ONOFF_PIN0 + i}' for i in range(NUM_ONOFF)])
         ax.set_yticks([])
         ax.tick_params(colors=self.colors['text_dim'])
         for side in ('top', 'right', 'left'):
@@ -540,13 +541,13 @@ def print_help():
 |    valve,off           Turn off valve  (e.g. 4,off)               |
 |    ?                   Query status of all regulators             |
 +-------------------------------------------------------------------+
-|  ON/OFF SOLENOIDS  (indices 0..5 == Giga pins D2..D7):            |
-|    dN,V                Set one    (d0,1  d0,on  d0,0  d0,off)     |
-|    dN,V,dM,V,..        Set several            (e.g. d0,1,d3,0)    |
+|  ON/OFF SOLENOIDS  (d2..d7 == Giga pins D2..D7):                  |
+|    dN,V                Set one    (d2,1  d2,on  d2,0  d2,off)     |
+|    dN,V,dM,V,..        Set several            (e.g. d2,1,d5,0)    |
 |    d,off               Release every on/off valve                 |
 |    d  or  d?           Query status of all on/off valves          |
 |                                                                   |
-|    NOTE: d0 is pin D2, d5 is pin D7. The index is NOT the pin.    |
+|    NOTE: the number IS the Giga pin: d2 drives D2, d7 drives D7.  |
 +-------------------------------------------------------------------+
 |  s                     EMERGENCY STOP (regulators AND solenoids)  |
 +-------------------------------------------------------------------+
@@ -616,8 +617,9 @@ def input_loop(controller):
                 continue
 
             # ==================== ON/OFF SOLENOIDS ====================
-            # Checked before the regulator parser: 'd0,1' must never reach
-            # int('d0'). Indices are 0..5 and map onto Giga pins D2..D7.
+            # Checked before the regulator parser: 'd2,1' must never reach
+            # int('d2'). The typed number is the Giga pin (d2..d7); it is
+            # shifted to the internal 0..5 index before set_onoff().
 
             if cmd_lower in ('d', 'd?'):
                 controller.query_onoff()
@@ -640,7 +642,7 @@ def input_loop(controller):
                         tok = parts[i]
                         if tok.startswith('d'):
                             tok = tok[1:]
-                        idx = int(tok)
+                        idx = int(tok) - ONOFF_PIN0
                         val = parts[i + 1]
                         if val in ('1', 'on'):
                             on = True
@@ -650,11 +652,12 @@ def input_loop(controller):
                             raise ValueError(f"bad value {val!r}")
                         pairs.append((idx, on))
                 except (ValueError, IndexError) as e:
-                    print(f"[ERR] {e}. Use: dN,V with V = 0/1/on/off, e.g. d0,1")
+                    print(f"[ERR] {e}. Use: dN,V with V = 0/1/on/off, e.g. d2,1")
                     continue
                 if controller.set_onoff(pairs):
                     print("  " + ", ".join(
-                        f"D{i}->{'ON' if on else 'OFF'}" for i, on in pairs))
+                        f"D{i + ONOFF_PIN0}->{'ON' if on else 'OFF'}"
+                        for i, on in pairs))
                 continue
 
             # ==================== VALVE CONTROL ====================
