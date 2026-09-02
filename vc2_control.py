@@ -47,7 +47,7 @@ NUM_VALVES = 32
 ROW_SIZE = 8
 NUM_ROWS = (NUM_VALVES + ROW_SIZE - 1) // ROW_SIZE
 BUS_SPLIT = 16          # valves 0..15 -> Wire, 16..31 -> Wire1
-MAX_INPUT_VALUE = 4000  # mV or kPa — never send values above this
+MAX_INPUT_VALUE = 5000  # mV — never send values above this (5000 mV = 200 kPa)
 
 
 def bus_name(valve):
