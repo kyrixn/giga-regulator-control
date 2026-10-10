@@ -32,6 +32,8 @@
  *   s                  Emergency stop (all 32 valves off)
  *   ?                  Query status of all valves
  *   p                  Ping test
+ *   i1 / i0            BNO055 IMU stream on / off (45 Hz frames, see imu_bno055.h)
+ *   i                  One IMU reading, human-readable
  */
 
 #include <Arduino.h>
@@ -41,6 +43,7 @@
 #include "valve_core.h"   // read-only accessors exposed to the display UI
 #include "ui_display.h"   // on-Giga touchscreen UI (non-blocking)
 #include "adc_ad7606.h"   // AD7606 analog acquisition on SPI (non-blocking)
+#include "imu_bno055.h"   // BNO055 IMU on Wire1, streamed to the PC (non-blocking)
 
 #define DACS_PER_BUS 8
 #define NUM_DACS     (DACS_PER_BUS * 2)   // 16 DACs across both buses
@@ -124,12 +127,15 @@ void buildMapping() {
     dacs[v1 + 1] = &dacBus1[d]; dacChannels[v1 + 1] = 1;
   }
 
-  // Assembly fix: the DAC channels for pairs 14/15, 26/27, 28/29, 30/31 were
+  // Assembly fix: the DAC channels for pairs 14/15, 26/27, 30/31 are
   // cross-wired to their regulators (each pair shares one DAC: 0x5F on Wire,
-  // 0x5D/0x5E/0x5F on Wire2). Swap the channel so a command for valve N
-  // reaches regulator N.
-  static const int swapPairs[4][2] = { {14, 15}, {26, 27}, {28, 29}, {30, 31} };
-  for (int i = 0; i < 4; i++) {
+  // 0x5D/0x5F on Wire2). Swap the channel so a command for valve N reaches
+  // regulator N. 28/29 (0x5E on Wire2) was swapped here too, but its
+  // regulators were then installed the other way round, so since 2026-10-09
+  // it takes the default channels.
+  static const int swapPairs[][2] = { {14, 15}, {26, 27}, {30, 31} };
+  static const int numSwapPairs = sizeof(swapPairs) / sizeof(swapPairs[0]);
+  for (int i = 0; i < numSwapPairs; i++) {
     int a = swapPairs[i][0], b = swapPairs[i][1];
     int t = dacChannels[a]; dacChannels[a] = dacChannels[b]; dacChannels[b] = t;
   }
@@ -360,6 +366,18 @@ void processSerialCommand() {
           return;
         }
 
+        if (cmdLower == "i1" || cmdLower == "i0") {
+          imu::stream(cmdLower == "i1");
+          inputBuffer = "";
+          return;
+        }
+
+        if (cmdLower == "i") {
+          imu::printOne();
+          inputBuffer = "";
+          return;
+        }
+
         parseCommand(inputBuffer);
         inputBuffer = "";
       }
@@ -472,7 +490,7 @@ void setup() {
     Serial.println("Range: 0 to 10000 mV");
   #endif
   Serial.println("Layout: V0-V15 on Wire, V16-V31 on Wire2");
-  Serial.println("Commands: valve,value | s=stop | ?=status | p=ping");
+  Serial.println("Commands: valve,value | s=stop | ?=status | p=ping | i1/i0/i=imu");
 
   // Bring up the touchscreen UI last, so valve state already reflects a clean
   // start. ui::tick() below is non-blocking and never delays serial handling.
@@ -488,10 +506,14 @@ void setup() {
   Serial.print(" ch @ ");
   Serial.print(ADC_SAMPLE_HZ);
   Serial.println("Hz) - type 'a' for readings");
+
+  // BNO055 on Wire1 -- after ui::begin(), which brings Wire1 up for the touch.
+  imu::begin();
 }
 
 void loop() {
   processSerialCommand();   // serial ALWAYS has priority, every iteration
   adc::tick();              // cooperative, non-blocking AD7606 sampling
+  imu::tick();              // cooperative, non-blocking IMU stream (off until 'i1')
   ui::tick();               // cooperative, non-blocking display + touch
 }

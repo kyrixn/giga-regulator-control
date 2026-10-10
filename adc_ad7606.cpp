@@ -94,18 +94,24 @@ void begin() {
   delayMicroseconds(50);
 
   // Presence probe: after a CONVST, a wired board drives BUSY high (~4us).
-  // Best-effort -- catches "BUSY/CS/power not connected".
-  pulseConvst();
+  // Best-effort -- catches "BUSY/CS/power not connected". Each board gets its
+  // own conversion and is polled right after it: the pulse is too short to
+  // check four boards off one CONVST, and a Serial.print with the PC attached
+  // takes far longer than 4us, so results are printed only afterwards.
   for (int b = 0; b < ADC_NUM_BOARDS; b++) {
+    pulseConvst();
     bool seen = false;
     uint32_t t0 = micros();
     while ((uint32_t)(micros() - t0) < 60) {
       if (digitalRead(BUSY_PINS[b])) { seen = true; break; }
     }
     g_present[b] = seen;
+    delayMicroseconds(20);   // let every board finish this conversion
+  }
+  for (int b = 0; b < ADC_NUM_BOARDS; b++) {
     Serial.print("ADC board ");
     Serial.print(b);
-    Serial.println(seen ? " present" : " ABSENT (check BUSY/CS/power/jumper)");
+    Serial.println(g_present[b] ? " present" : " ABSENT (check BUSY/CS/power/jumper)");
   }
   waitBusyDone();
 
