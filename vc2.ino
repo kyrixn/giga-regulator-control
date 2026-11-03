@@ -32,8 +32,6 @@
  *   s                  Emergency stop (all 32 valves off)
  *   ?                  Query status of all valves
  *   p                  Ping test
- *   i1 / i0            BNO055 IMU stream on / off (45 Hz frames, see imu_bno055.h)
- *   i                  One IMU reading, human-readable
  */
 
 #include <Arduino.h>
@@ -43,7 +41,6 @@
 #include "valve_core.h"   // read-only accessors exposed to the display UI
 #include "ui_display.h"   // on-Giga touchscreen UI (non-blocking)
 #include "adc_ad7606.h"   // AD7606 analog acquisition on SPI (non-blocking)
-#include "imu_bno055.h"   // BNO055 IMU on Wire1, streamed to the PC (non-blocking)
 
 #define DACS_PER_BUS 8
 #define NUM_DACS     (DACS_PER_BUS * 2)   // 16 DACs across both buses
@@ -366,18 +363,6 @@ void processSerialCommand() {
           return;
         }
 
-        if (cmdLower == "i1" || cmdLower == "i0") {
-          imu::stream(cmdLower == "i1");
-          inputBuffer = "";
-          return;
-        }
-
-        if (cmdLower == "i") {
-          imu::printOne();
-          inputBuffer = "";
-          return;
-        }
-
         parseCommand(inputBuffer);
         inputBuffer = "";
       }
@@ -490,7 +475,7 @@ void setup() {
     Serial.println("Range: 0 to 10000 mV");
   #endif
   Serial.println("Layout: V0-V15 on Wire, V16-V31 on Wire2");
-  Serial.println("Commands: valve,value | s=stop | ?=status | p=ping | i1/i0/i=imu");
+  Serial.println("Commands: valve,value | s=stop | ?=status | p=ping");
 
   // Bring up the touchscreen UI last, so valve state already reflects a clean
   // start. ui::tick() below is non-blocking and never delays serial handling.
@@ -506,14 +491,10 @@ void setup() {
   Serial.print(" ch @ ");
   Serial.print(ADC_SAMPLE_HZ);
   Serial.println("Hz) - type 'a' for readings");
-
-  // BNO055 on Wire1 -- after ui::begin(), which brings Wire1 up for the touch.
-  imu::begin();
 }
 
 void loop() {
   processSerialCommand();   // serial ALWAYS has priority, every iteration
   adc::tick();              // cooperative, non-blocking AD7606 sampling
-  imu::tick();              // cooperative, non-blocking IMU stream (off until 'i1')
   ui::tick();               // cooperative, non-blocking display + touch
 }
